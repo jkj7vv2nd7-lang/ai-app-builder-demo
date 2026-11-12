@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="OllamaとローカルAIモデルを使う、Windows対応のAIアプリ開発エージェント。">
+  <title>ローカルAIアプリ開発エージェント</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #566178;
+      --paper: #f7f8fc;
+      --surface: #fff;
+      --line: #e1e6f0;
+      --accent: #3156c9;
+      --accent-dark: #233f9b;
+      --soft: #edf1ff;
+      font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      line-height: 1.7;
+    }
+    a { color: var(--accent-dark); }
+    .wrap { width: min(940px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 64px 0 42px; }
+    .eyebrow {
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    h1 { max-width: 760px; margin: 12px 0; font-size: clamp(2rem, 6vw, 3.6rem); line-height: 1.2; }
+    h2 { margin-top: 0; font-size: 1.55rem; }
+    .lead { max-width: 720px; color: var(--muted); font-size: 1.15rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 26px; }
+    .button {
+      display: inline-block;
+      padding: 11px 17px;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .button.secondary { background: transparent; color: var(--accent-dark); }
+    main { padding-bottom: 48px; }
+    section {
+      margin: 14px 0;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+    }
+    .notice { border-left: 5px solid var(--accent); background: var(--soft); }
+    .flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 0; list-style: none; }
+    .flow li { padding: 14px; border-radius: 9px; background: var(--soft); text-align: center; font-weight: 700; }
+    code, pre { font-family: Consolas, "Cascadia Code", monospace; }
+    pre { overflow-x: auto; padding: 14px; border-radius: 9px; background: #172033; color: #f4f6ff; }
+    .muted { color: var(--muted); }
+    footer { padding: 24px 0 42px; color: var(--muted); font-size: .95rem; }
+    @media (max-width: 650px) {
+      header { padding-top: 42px; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      section { padding: 19px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="wrap">
+    <div class="eyebrow">Local AI App Builder</div>
+    <h1>アイデアから、ローカルで動くアプリの試作品へ。</h1>
+    <p class="lead">
+      OllamaとローカルAIモデルが、要件整理・画面設計・HTML実装・QAを順に進める
+      Windows対応のオープンソース開発エージェントです。
+    </p>
+    <div class="actions">
+      <a class="button" href="https://github.com/jkj7vv2nd7-lang/ai-app-builder-demo">GitHubでソースを見る</a>
+      <a class="button secondary" href="https://github.com/jkj7vv2nd7-lang/ai-app-builder-demo/blob/main/README.md">セットアップ手順</a>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="notice">
+      <h2>このページは案内用です</h2>
+      <p>
+        GitHub Pagesは静的ページを表示します。Python、Tkinter、OllamaのAIモデルはブラウザー上では動きません。
+        エージェントを使うには、ソースをPCへダウンロードし、PythonとOllamaを準備してローカルで起動してください。
+      </p>
+    </section>
+
+    <section>
+      <h2>開発の流れ</h2>
+      <ol class="flow">
+        <li>PM<br>要件整理</li>
+        <li>設計<br>画面・操作</li>
+        <li>実装<br>単一HTML</li>
+        <li>QA<br>確認・保存</li>
+      </ol>
+      <p class="muted">最初の入力はラフな一文で大丈夫。エージェントが具体的な要件や受け入れ条件に整理します。</p>
+    </section>
+
+    <section>
+      <h2>まずはローカルで起動</h2>
+      <p>Python 3.9以降、Tkinter、Ollamaが必要です。初回は選んだモデルをダウンロードします。</p>
+      <pre><code>ollama pull qwen2.5-coder:7b
+git clone https://github.com/jkj7vv2nd7-lang/ai-app-builder-demo.git
+cd ai-app-builder-demo
+python .\app_gui.py</code></pre>
+      <p>
+        おすすめ自動ルーティングでは要件・設計に<code>qwen3:8b</code>、実装・QAに
+        <code>qwen2.5-coder:7b</code>を使います。詳細は
+        <a href="https://github.com/jkj7vv2nd7-lang/ai-app-builder-demo/blob/main/README.md">README</a>をご覧ください。
+      </p>
+    </section>
+
+    <section>
+      <h2>プライバシーと公開について</h2>
+      <p>
+        生成リクエストはローカルOllamaへ送ります。モデルの初回取得には通信が必要です。
+        生成したアプリをGitHubへ公開するときは、公開リポジトリでHTMLとソースが誰でも見られるため、
+        内容を確認してから明示的に操作してください。
+      </p>
+      <p>ライセンス: <a href="https://github.com/jkj7vv2nd7-lang/ai-app-builder-demo/blob/main/LICENSE">MIT License</a></p>
+    </section>
+  </main>
+
+  <footer class="wrap">
+    <p>ローカルAIアプリ開発エージェント — Pythonで動作するデスクトップツールの紹介ページ</p>
+  </footer>
+</body>
+</html>

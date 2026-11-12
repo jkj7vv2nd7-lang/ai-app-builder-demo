@@ -1,0 +1,310 @@
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+from urllib.error import URLError
+
+
+TOOL_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TOOL_DIR))
+import app_builder  # noqa: E402
+import app_gui  # noqa: E402
+
+
+class HtmlExtractionTests(unittest.TestCase):
+    def test_extracts_html_from_fenced_response_with_surrounding_text(self):
+        response = "完成しました。\n```html\n<!doctype html><html></html>\n```\n以上です。"
+        self.assertEqual(
+            app_builder.extract_html(response),
+            "<!doctype html><html></html>",
+        )
+
+    def test_does_not_treat_explanation_as_html(self):
+        self.assertIsNone(app_builder.extract_html("HTMLを作成できませんでした。"))
+
+    def test_checks_required_document_elements(self):
+        checks = app_builder.validate_html(
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><p>App</p></body></html>"
+        )
+        self.assertTrue(checks["passed"], checks["errors"])
+        self.assertEqual(checks["external_dependencies"], [])
+        self.assertEqual(checks["network_api_usage"], [])
+
+    def test_reports_external_resources_and_network_api_usage(self):
+        html = (
+            '<html><head><script src="https://cdn.example/app.js"></script></head>'
+            "<body><main>App</main><script>fetch('/data');</script></body></html>"
+        )
+        checks = app_builder.validate_html(html)
+        self.assertTrue(checks["passed"], checks["errors"])
+        self.assertTrue(any("cdn.example" in item for item in checks["external_dependencies"]))
+        self.assertIn("fetch(", checks["network_api_usage"])
+
+    def test_reports_missing_body(self):
+        checks = app_builder.validate_html("<html><head></head></html>")
+        self.assertFalse(checks["passed"])
+        self.assertIn("missing <body> element", checks["errors"])
+
+    def test_rejects_empty_body(self):
+        checks = app_builder.validate_html("<html><head></head><body></body></html>")
+        self.assertFalse(checks["passed"])
+        self.assertIn("<body> has no content", checks["errors"])
+
+    def test_qa_requires_explicit_verdict(self):
+        self.assertEqual(
+            app_builder.extract_qa_status("QA_STATUS: NEEDS_REVISION\nFix a label."),
+            "NEEDS_REVISION",
+        )
+        self.assertIsNone(app_builder.extract_qa_status("Looks good to me."))
+
+
+class OutputAndApiTests(unittest.TestCase):
+    def test_output_path_must_stay_inside_tool_directory(self):
+        with self.assertRaises(ValueError):
+            app_builder.resolve_output_root(str(TOOL_DIR.parent / "outside"))
+
+    @patch.object(app_builder.urllib.request, "urlopen", side_effect=URLError("offline"))
+    def test_connection_errors_are_not_returned_as_empty_success(self, _urlopen):
+        args = type(
+            "Args",
+            (),
+            {
+                "model": "test",
+                "endpoint": "http://localhost:11434/api/generate",
+                "temperature": 0.3,
+                "num_predict": 128,
+                "num_ctx": 2048,
+                "timeout": 1,
+            },
+        )()
+        with self.assertRaises(app_builder.StageError) as context:
+            app_builder.call_ollama("prompt", "system", args, "design")
+        self.assertEqual(context.exception.stage, "design")
+        self.assertIn("could not connect", str(context.exception))
+
+    def test_stage_model_falls_back_to_common_model(self):
+        args = SimpleNamespace(
+            model="common-model",
+            planning_model="planning-model",
+            implementation_model="implementation-model",
+            qa_model=None,
+        )
+        self.assertEqual(app_builder.selected_model(args, "requirements"), "planning-model")
+        self.assertEqual(app_builder.selected_model(args, "design"), "planning-model")
+        self.assertEqual(app_builder.selected_model(args, "implementation"), "implementation-model")
+        self.assertEqual(app_builder.selected_model(args, "qa"), "common-model")
+
+    @patch.object(app_builder.urllib.request, "urlopen")
+    def test_api_uses_selected_stage_model_and_unloads_after_each_call(self, urlopen):
+        urlopen.return_value.__enter__.return_value.read.return_value = b'{"response":"ok"}'
+        args = SimpleNamespace(
+            model="common-model",
+            planning_model=None,
+            implementation_model="coder-model",
+            qa_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3,
+            num_predict=128,
+            num_ctx=2048,
+            timeout=10,
+        )
+        self.assertEqual(app_builder.call_ollama("prompt", "system", args, "implementation"), "ok")
+        payload = app_builder.json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(payload["model"], "coder-model")
+        self.assertEqual(payload["keep_alive"], 0)
+
+    def test_defaults_target_code_model_and_cpu_context(self):
+        args = app_builder.build_parser().parse_args(["sample app"])
+        self.assertEqual(args.model, "qwen2.5-coder:7b")
+        self.assertEqual(args.num_ctx, 4096)
+        self.assertFalse(args.browser_check)
+        self.assertEqual(args.routing_mode, "single")
+
+    def test_auto_routing_uses_fixed_role_models(self):
+        args = app_builder.build_parser().parse_args(["--routing-mode", "auto", "sample app"])
+        models = app_builder.models_for_run(args)
+        self.assertEqual(models["planning"], "qwen3:8b")
+        self.assertEqual(models["implementation"], "qwen2.5-coder:7b")
+        self.assertEqual(models["qa"], "qwen2.5-coder:7b")
+
+    def test_auto_routing_requires_explicit_installation_instead_of_fallback(self):
+        required = app_gui.models_for_mode("auto", "single-model")
+        missing = app_gui.missing_models(required, ["single-model"])
+        self.assertEqual(missing, ["qwen2.5-coder:7b", "qwen3:8b"])
+
+    def test_auto_routing_cli_stops_with_pull_advice_when_model_is_missing(self):
+        error_stream = io.StringIO()
+        with patch.object(app_builder, "fetch_ollama_model_names", return_value=["qwen2.5-coder:7b"]), \
+             patch.object(app_builder, "create_run_directory") as create_run, \
+             contextlib.redirect_stderr(error_stream):
+            code = app_builder.main(["--routing-mode", "auto", "sample app"])
+        self.assertEqual(code, 1)
+        self.assertIn("ollama pull qwen3:8b", error_stream.getvalue())
+        self.assertIn("単一モデル", error_stream.getvalue())
+        create_run.assert_not_called()
+
+    def test_auto_routing_cli_runs_only_after_both_models_are_present(self):
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(
+                app_builder,
+                "fetch_ollama_model_names",
+                return_value=["qwen3:8b", "qwen2.5-coder:7b"],
+            ), patch.object(app_builder, "create_run_directory", return_value=run_dir), patch.object(
+                app_builder, "run_pipeline", return_value=0
+            ) as run_pipeline:
+                code = app_builder.main(["--routing-mode", "auto", "sample app"])
+        self.assertEqual(code, 0)
+        self.assertEqual(run_pipeline.call_args.args[1].routing_mode, "auto")
+
+    @patch.object(app_builder.urllib.request, "urlopen")
+    def test_local_model_check_reads_ollama_tags(self, urlopen):
+        urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(
+            {"models": [{"name": "qwen3:8b"}, {"name": "qwen2.5-coder:7b"}]}
+        ).encode("utf-8")
+        installed = app_gui.fetch_ollama_models("http://localhost:11434/api/generate")
+        self.assertIn("qwen3:8b", installed)
+        self.assertEqual(
+            urlopen.call_args.args[0].full_url,
+            "http://localhost:11434/api/tags",
+        )
+
+    def test_single_model_mode_remains_explicit_and_stage_models_are_optional(self):
+        args = app_gui.build_run_args(
+            "http://localhost:11434/api/generate",
+            "one-model",
+            {"planning": "planner", "implementation": "", "qa": ""},
+            4096,
+            timeout_seconds=1200,
+        )
+        self.assertEqual(app_builder.models_for_run(args), {
+            "planning": "planner",
+            "implementation": "one-model",
+            "qa": "one-model",
+        })
+        self.assertEqual(args.timeout, 1200)
+
+    def test_auto_routing_disallows_hidden_manual_overrides(self):
+        with self.assertRaises(ValueError):
+            app_gui.build_run_args(
+                "http://localhost:11434/api/generate",
+                "one-model",
+                {"planning": "planner"},
+                4096,
+                routing_mode="auto",
+            )
+
+    def test_gui_reports_invalid_timeout_as_a_form_error(self):
+        with self.assertRaisesRegex(ValueError, "タイムアウト"):
+            app_gui.build_run_args(
+                "http://localhost:11434/api/generate",
+                "one-model",
+                None,
+                4096,
+                timeout_seconds="not a number",
+            )
+
+    def test_gui_refuses_non_local_model_endpoints(self):
+        with self.assertRaises(ValueError):
+            app_gui.validate_local_endpoint("https://example.com/api/generate")
+
+    def test_cli_endpoint_is_local_only(self):
+        parser = app_builder.build_parser()
+        args = parser.parse_args(["--endpoint", "https://example.com/api/generate", "app"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                app_builder.validate_args(parser, args)
+
+    def test_error_guidance_suggests_memory_and_connection_recovery(self):
+        memory_help = app_gui.error_guidance("実装", "out of memory")
+        self.assertIn("2048", memory_help)
+        self.assertIn("小さい", memory_help)
+        connection_help = app_gui.error_guidance("接続確認", "Could not connect")
+        self.assertIn("Ollamaアプリを起動", connection_help)
+        self.assertIn("localhost", connection_help)
+        model_help = app_gui.error_guidance("モデル確認", "指定モデルが未導入です。", ["qwen3:8b"])
+        self.assertIn("ollama pull qwen3:8b", model_help)
+        timeout_help = app_gui.error_guidance("QA", "request timed out")
+        self.assertIn("タイムアウトを長く", timeout_help)
+
+    def test_empty_app_idea_is_rejected_with_clear_guidance(self):
+        with self.assertRaisesRegex(ValueError, "説明を入力"):
+            app_gui.validate_request_text("  \n")
+        self.assertEqual(app_gui.validate_request_text("  ToDo app  "), "ToDo app")
+
+    def test_gui_progress_maps_pipeline_messages_to_phases(self):
+        self.assertEqual(app_gui.progress_phase("[2/4] デザイン設計を作成中..."), 1)
+        self.assertEqual(app_gui.progress_phase("[QA] レビュー 1/3"), 3)
+        self.assertIsNone(app_gui.progress_phase("[INFO] 出力先"))
+
+    def test_windows_launcher_resolves_gui_relative_to_its_own_folder(self):
+        launcher = (TOOL_DIR / "launch_gui.bat").read_text(encoding="utf-8")
+        self.assertIn('"%~dp0launch_gui.pyw"', launcher)
+        self.assertIn("where pyw", launcher)
+        self.assertIn("where pythonw", launcher)
+
+    @patch.dict(sys.modules, {"playwright": None})
+    def test_optional_browser_check_skips_when_playwright_is_missing(self):
+        result = app_builder.run_browser_check("<html></html>")
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("未導入", result["reason"])
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model="test-model",
+            planning_model=None,
+            implementation_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3,
+            num_predict=256,
+            num_ctx=2048,
+            timeout=10,
+            max_qa_revisions=1,
+            browser_check=False,
+        )
+        self.html = (
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><main>Working app</main></body></html>"
+        )
+
+    def run_pipeline_with_responses(self, qa_response):
+        responses = ["Requirements", "Design", self.html, qa_response]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exit_code = app_builder.run_pipeline("Test app", self.args, run_dir)
+            manifest = app_builder.json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            saved_html = (run_dir / "index.html").read_text(encoding="utf-8")
+            return exit_code, manifest, saved_html
+
+    def test_explicit_approval_completes_pipeline(self):
+        qa_response = f"QA_STATUS: APPROVED\n\n```html\n{self.html}\n```"
+        exit_code, manifest, saved_html = self.run_pipeline_with_responses(qa_response)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertTrue(manifest["qa_approved"])
+        self.assertEqual(manifest["models"]["planning"], "test-model")
+        self.assertEqual(manifest["browser_check"]["status"], "skipped")
+        self.assertIn("<main>", saved_html)
+
+    def test_qa_without_html_preserves_valid_code_as_unapproved(self):
+        exit_code, manifest, saved_html = self.run_pipeline_with_responses(
+            "QA_STATUS: APPROVED\nEverything looks fine."
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(manifest["status"], "completed_unapproved")
+        self.assertFalse(manifest["qa_approved"])
+        self.assertIn("<main>", saved_html)
+
+
+if __name__ == "__main__":
+    unittest.main()
