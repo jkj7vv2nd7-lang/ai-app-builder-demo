@@ -826,8 +826,10 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
         log(f"[INFO] {label}: {models[stage]}" + (f"（{reason}）" if reason else ""))
     for cmd in routing_suggestions:
         log(f"[INFO] 任意の改善案: {cmd} を導入すると、その部署はさらに得意なモデルに切り替わります（今のモデルでも続行できます）")
+    log(f"[INFO] 今回の指示文: {request_text}")
     if resume:
         log("[RESUME] 完了済みの工程は保存済みの成果物を使って飛ばします。")
+        log("[INFO] 再開では前回の指示文をそのまま使います。出来上がりを変えたい場合は、完成後に「ダメ出し」で直してほしい点を伝えてください。")
 
     try:
         # --- 1/4 requirements ---
@@ -1262,6 +1264,7 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
         manifest["qa_approved"] = qa_approved
         manifest["qa_note"] = qa_note
         manifest["static_checks"] = checks
+        manifest["changed"] = current_html.strip() != source_html.strip()
         final_defects = []
         if not qa_approved and qa_rounds:
             for line in str(qa_rounds[-1].get("defects") or "").splitlines():
@@ -1276,6 +1279,8 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
         write_json(manifest_path, manifest)
         log(f"[DONE] 状態: {manifest['status']}")
         log(f"[DONE] HTML: {run_dir / 'index.html'}")
+        if not manifest["changed"]:
+            log("[WARN] 修正版は元のアプリと同一でした（変化なし）。指摘の書き方を変えて、もう一度ダメ出ししてください。")
         if not qa_approved:
             log(f"[WARN] {qa_note}")
         return (0 if qa_approved else 2), run_dir

@@ -274,14 +274,16 @@ class AppBuilderWindow:
         self.last_activity_at = None
         self.revision_target = None
         self.revision_return = "welcome"
+        self.activity_name = ""
+        self.qa_round = 0
         self._fonts = []
         self._scale_idx = 0
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.1")
-        root.geometry("1060x800")
-        root.minsize(920, 680)
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.2")
+        root.geometry("1060x830")
+        root.minsize(920, 700)
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -376,7 +378,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.1 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.2 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)
@@ -404,13 +406,61 @@ class AppBuilderWindow:
         self.current_page = name
         self.pages[name].tkraise()
         self.step_label.configure(text=self._STEP_TEXT.get(name, ""))
+        if name == "welcome" and hasattr(self, "runs_list_frame"):
+            self.refresh_runs_list()
+
+    def refresh_runs_list(self):
+        for child in self.runs_list_frame.winfo_children():
+            child.destroy()
+        runs_root = Path(__file__).resolve().parent / "runs"
+        run_dirs = []
+        if runs_root.is_dir():
+            run_dirs = sorted(
+                (d for d in runs_root.iterdir() if d.is_dir() and (d / "run.json").is_file()),
+                key=lambda d: d.stat().st_mtime, reverse=True)[:6]
+        if not run_dirs:
+            tk.Label(self.runs_list_frame, text="まだ作品はありません。「アプリを作りはじめる」からどうぞ。",
+                     font=self.F(12), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+            return
+        status_text = {"completed": "完成", "completed_unapproved": "完成（QA未承認）",
+                       "running": "作業中", "cancelled": "途中で中止", "failed": "途中で停止"}
+        for run_dir in run_dirs:
+            try:
+                info = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                info = {}
+            status = str(info.get("status") or "")
+            request = str(info.get("request") or run_dir.name)
+            if info.get("mode") == "revision":
+                request = "（ダメ出しの修正版）" + request
+            row = self._card(self.runs_list_frame)
+            row.pack(fill="x", pady=(0, 8))
+            left = tk.Frame(row, bg=CARD)
+            left.pack(side="left", fill="x", expand=True)
+            tk.Label(left, text=request[:64], font=self.F(13, True), fg=INK, bg=CARD,
+                     anchor="w").pack(fill="x")
+            tk.Label(left, text=f"{status_text.get(status, status)} ／ {run_dir.name}",
+                     font=self.F(11), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
+            has_html = (run_dir / "index.html").is_file()
+            if has_html:
+                tk.Button(row, text="✎ ダメ出し",
+                          command=lambda d=run_dir: self.goto_revision(d, "welcome"),
+                          font=self.F(13, True), bg=PRIMARY, fg="#FFFFFF", relief="flat",
+                          padx=18, pady=9, cursor="hand2", activebackground=PRIMARY_DARK,
+                          activeforeground="#FFFFFF").pack(side="right")
+            if status not in ("completed", "completed_unapproved") or not has_html:
+                tk.Button(row, text="▶ つづき",
+                          command=lambda d=run_dir: self.resume_generation(d),
+                          font=self.F(13), bg=CARD, fg=PRIMARY_DARK, relief="flat",
+                          padx=18, pady=9, cursor="hand2",
+                          highlightbackground=LINE, highlightthickness=1).pack(side="right", padx=(0, 8))
 
     # ---- page: welcome ----
     def _page_welcome(self, page):
         hero = self._card(page)
-        hero.pack(fill="x", padx=26, pady=(24, 14))
+        hero.pack(fill="x", padx=26, pady=(16, 10))
         tk.Label(hero, text="一言のアイデアから、動くアプリを作ります。",
-                 font=self.F(25, True), fg=NAVY, bg=CARD, anchor="w").pack(fill="x")
+                 font=self.F(23, True), fg=NAVY, bg=CARD, anchor="w").pack(fill="x")
         tk.Label(hero,
                  text="4人のAI社員が「要件 → 設計 → 実装 → 検査」の順に仕事を進めます。"
                       "部署ごとに、その仕事が一番得意なモデルへ自動で切り替わります。"
@@ -419,23 +469,23 @@ class AppBuilderWindow:
                  wraplength=920, justify="left").pack(fill="x", pady=(6, 0))
 
         cards = tk.Frame(page, bg=BG)
-        cards.pack(fill="x", padx=26, pady=(2, 14))
+        cards.pack(fill="x", padx=26, pady=(2, 10))
         self.dept_card_models = {}
         for idx, (key, emoji, dept_name, role) in enumerate(DEPARTMENTS):
             card = self._card(cards)
             card.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 6, 0))
             cards.grid_columnconfigure(idx, weight=1)
-            tk.Label(card, text=emoji, font=self.F(30), bg=CARD).pack()
+            tk.Label(card, text=emoji, font=self.F(24), bg=CARD).pack()
             tk.Label(card, text=dept_name, font=self.F(15, True), fg=INK, bg=CARD).pack()
             tk.Label(card, text=role, font=self.F(11), fg=MUTED, bg=CARD,
-                     wraplength=190, justify="center").pack(pady=(2, 4))
+                     wraplength=190, justify="center").pack(pady=(0, 2))
             model_label = tk.Label(card, text="モデル確認中…", font=self.F(12, True),
                                    fg=PRIMARY_DARK, bg=SOFT, wraplength=190, justify="center")
-            model_label.pack(fill="x", ipady=4)
+            model_label.pack(fill="x", ipady=2)
             self.dept_card_models[key] = model_label
 
         conn = self._card(page)
-        conn.pack(fill="x", padx=26, pady=(0, 16))
+        conn.pack(fill="x", padx=26, pady=(0, 12))
         self.conn_label = tk.Label(conn, text="● Ollamaを確認しています…",
                                    font=self.F(14, True), fg=MUTED, bg=CARD, anchor="w")
         self.conn_label.pack(side="left")
@@ -455,7 +505,13 @@ class AppBuilderWindow:
         self._big_button(actions, "⚙ 設定", lambda: self.show_page("settings")).pack(side="right")
         tk.Label(page,
                  text="「つづきから再開」は途中で止まった作業の続き、「✎ ダメ出し」は完成した作品に直してほしいことを伝えて直してもらうときに使います。",
-                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=26, pady=(10, 0))
+                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=26, pady=(6, 0))
+        tk.Label(page, text="これまでの作品", font=self.F(17, True), fg=NAVY, bg=BG,
+                 anchor="w").pack(fill="x", padx=26, pady=(10, 2))
+        tk.Label(page, text="作品ごとに、そのまま「ダメ出し」や「つづき」ができます。",
+                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=26)
+        self.runs_list_frame = tk.Frame(page, bg=BG)
+        self.runs_list_frame.pack(fill="x", padx=26, pady=(6, 10))
 
     # ---- page: idea ----
     def _page_idea(self, page):
@@ -632,7 +688,7 @@ class AppBuilderWindow:
             style.configure("Big.Horizontal.TProgressbar", thickness=22)
         except tk.TclError:
             pass
-        self.progress_bar = ttk.Progressbar(page, mode="determinate", maximum=400, value=0,
+        self.progress_bar = ttk.Progressbar(page, mode="determinate", maximum=100, value=0,
                                             style="Big.Horizontal.TProgressbar")
         self.progress_bar.pack(fill="x", padx=26, pady=(2, 10))
         toggle = tk.Checkbutton(page, text="作業ログを見る", variable=self.show_log_var,
@@ -674,22 +730,39 @@ class AppBuilderWindow:
     # ---- page: done ----
     def _page_done(self, page):
         wrap = tk.Frame(page, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=26, pady=(30, 0))
-        self.done_icon = tk.Label(wrap, text="✓", font=self.F(54, True), fg=GREEN, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=26, pady=(12, 0))
+        self.done_icon = tk.Label(wrap, text="✓", font=self.F(36, True), fg=GREEN, bg=BG)
         self.done_icon.pack()
         self.done_title = tk.Label(wrap, text="", font=self.F(24, True), fg=NAVY, bg=BG,
                                    wraplength=940, justify="center")
-        self.done_title.pack(pady=(6, 4))
-        self.done_message = tk.Label(wrap, text="", font=self.F(14), fg=MUTED, bg=BG,
+        self.done_title.pack(pady=(2, 2))
+        self.done_message = tk.Label(wrap, text="", font=self.F(13), fg=MUTED, bg=BG,
                                      wraplength=900, justify="center")
         self.done_message.pack()
         self.done_path = tk.Label(wrap, text="", font=self.F(11), fg=MUTED, bg=BG,
                                   wraplength=900, justify="center")
-        self.done_path.pack(pady=(8, 18))
+        self.done_path.pack(pady=(4, 8))
+        self.done_feedback_card = self._card(wrap)
+        self.done_feedback_card.pack(fill="x", pady=(2, 10))
+        tk.Label(self.done_feedback_card, text="できあがりはどうですか？",
+                 font=self.F(17, True), fg=NAVY, bg=CARD, anchor="w").pack(fill="x")
+        tk.Label(self.done_feedback_card,
+                 text="直してほしいことがあれば、下に書いて「この内容で直す」を押してください。その場で修正が始まります。",
+                 font=self.F(12), fg=MUTED, bg=CARD, anchor="w", wraplength=880).pack(fill="x")
+        self.done_feedback_text = scrolledtext.ScrolledText(
+            self.done_feedback_card, height=2, wrap="word", font=self.F(14), padx=12, pady=8,
+            highlightbackground=LINE, highlightthickness=1, relief="flat")
+        self.done_feedback_text.pack(fill="x", pady=(8, 8))
+        self.done_feedback_button = self._big_button(
+            self.done_feedback_card, "▶ この内容で直す", self.start_revision_from_done, primary=True)
+        self.done_feedback_button.pack(anchor="w")
+        self.done_feedback_note = tk.Label(self.done_feedback_card, text="",
+                                           font=self.F(11), fg=MUTED, bg=CARD, anchor="w")
+        self.done_feedback_note.pack(fill="x", pady=(6, 0))
         buttons = tk.Frame(wrap, bg=BG)
         buttons.pack()
         self.preview_button = self._big_button(buttons, "▶ 生成したアプリを開く", self.preview_output, primary=True)
-        self.preview_button.pack(pady=(0, 10))
+        self.preview_button.pack(pady=(0, 8))
         row = tk.Frame(buttons, bg=BG)
         row.pack()
         self.open_button = self._big_button(row, "フォルダーを開く", self.open_output)
@@ -700,6 +773,9 @@ class AppBuilderWindow:
         self.revise_done_button = self._big_button(
             buttons, "✎ ダメ出し：直してほしいことを伝える",
             lambda: self.goto_revision(self.last_output, "done"))
+        tk.Label(wrap,
+                 text="「つづき」は同じ指示で残りの工程を行うもの、「ダメ出し」は直してほしい点を伝えて作り直すものです。",
+                 font=self.F(11), fg=MUTED, bg=BG, wraplength=900, justify="center").pack(pady=(12, 0))
 
     def new_app(self):
         self.request_text.delete("1.0", "end")
@@ -713,7 +789,8 @@ class AppBuilderWindow:
 
     def _show_done(self, code, output):
         output = Path(output)
-        self.progress_bar.configure(value=400 if code in (0, 2) else self.progress_bar["value"])
+        self.progress_bar.configure(value=100 if code in (0, 2) else self.progress_bar["value"])
+        self.done_feedback_text.delete("1.0", "end")
         self.revise_done_button.pack_forget()
         if code == 0:
             self.done_icon.configure(text="✓", fg=GREEN)
@@ -758,8 +835,20 @@ class AppBuilderWindow:
         self.revise_done_button.pack_forget()
         can_revise = output and ((output / "index.html").is_file()
                                  or (output / "index_draft_unverified.html").is_file())
-        if can_revise:
-            self.revise_done_button.pack(pady=(10, 0))
+        self.done_feedback_button.configure(state="normal" if can_revise else "disabled")
+        self.done_feedback_note.configure(
+            text="修正版は新しいフォルダーに保存され、今の作品はそのまま残ります。"
+            if can_revise else
+            "まだアプリ本体（index.html）がないため、ダメ出しはできません。「つづき」から完成させてください。")
+        if self.run_mode == "revision":
+            try:
+                done_manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                done_manifest = {}
+            if done_manifest.get("changed") is False:
+                self.done_message.configure(
+                    text=self.done_message.cget("text") +
+                    "\n\n※今回は前回と変わりませんでした。指摘の書き方を変えて（例: どの部分が・どう動かないか）、もう一度ダメ出ししてみてください。")
         self.done_path.configure(text=f"保存先: {output}")
         self.show_page("done")
 
@@ -865,16 +954,7 @@ class AppBuilderWindow:
             "（前回の実機でも、実装に大きなモデルが選ばれていて止まって見えました）\n\n"
             "このまま続けますか？", parent=self.root)
 
-    def start_revision(self):
-        if self.busy or not self.revision_target:
-            return
-        notes = self.revision_notes.get("1.0", "end").strip()
-        if not notes:
-            messagebox.showwarning("修正依頼を書いてください",
-                                   "直してほしいことを入力欄に書いてから「修正をはじめる」を押してください。",
-                                   parent=self.root)
-            self.revision_notes.focus_set()
-            return
+    def _start_revision_with_notes(self, notes):
         try:
             validate_local_endpoint(self.endpoint_var.get())
             args, required = self._build_args_and_required()
@@ -886,6 +966,32 @@ class AppBuilderWindow:
         if not self._confirm_big_models(required):
             return
         self._begin_revision(notes, required, args)
+
+    def start_revision(self):
+        if self.busy or not self.revision_target:
+            return
+        notes = self.revision_notes.get("1.0", "end").strip()
+        if not notes:
+            messagebox.showwarning("修正依頼を書いてください",
+                                   "直してほしいことを入力欄に書いてから「修正をはじめる」を押してください。",
+                                   parent=self.root)
+            self.revision_notes.focus_set()
+            return
+        self._start_revision_with_notes(notes)
+
+    def start_revision_from_done(self):
+        if self.busy or not self.last_output:
+            return
+        notes = self.done_feedback_text.get("1.0", "end").strip()
+        if not notes:
+            messagebox.showinfo(
+                "ダメ出し",
+                "直してほしいことを上の欄に書いてから押してください。\n問題がなければ、そのままお使いください。",
+                parent=self.root)
+            self.done_feedback_text.focus_set()
+            return
+        self.revision_target = Path(self.last_output)
+        self._start_revision_with_notes(notes)
 
     def _apply_phase_names(self, mode):
         if mode == "revision":
@@ -904,6 +1010,8 @@ class AppBuilderWindow:
         self.active_models = required
         self._apply_phase_names("revision")
         self.current_phase = 0
+        self.activity_name = ""
+        self.qa_round = 0
         self.run_started_at = time.monotonic()
         self.last_activity_at = self.run_started_at
         for key, _e, _n, _r in DEPARTMENTS:
@@ -1049,17 +1157,20 @@ class AppBuilderWindow:
             return
         self._begin_run(request, required, args, resume_dir=None)
 
-    def resume_generation(self):
+    def resume_generation(self, from_dir=None):
         if self.busy:
             return
-        runs_root = Path(__file__).resolve().parent / "runs"
-        chosen = filedialog.askdirectory(
-            title="再開する実行フォルダーを選んでください（run.json のあるフォルダー）",
-            initialdir=str(runs_root) if runs_root.exists() else str(Path(__file__).resolve().parent),
-            parent=self.root)
-        if not chosen:
-            return
-        run_dir = Path(chosen)
+        if from_dir is not None:
+            run_dir = Path(from_dir)
+        else:
+            runs_root = Path(__file__).resolve().parent / "runs"
+            chosen = filedialog.askdirectory(
+                title="再開する実行フォルダーを選んでください（run.json のあるフォルダー）",
+                initialdir=str(runs_root) if runs_root.exists() else str(Path(__file__).resolve().parent),
+                parent=self.root)
+            if not chosen:
+                return
+            run_dir = Path(chosen)
         manifest_path = run_dir / "run.json"
         if not manifest_path.is_file():
             messagebox.showerror("再開できません", "選んだフォルダーに run.json がありません。実行フォルダーそのものを選んでください。", parent=self.root)
@@ -1073,6 +1184,19 @@ class AppBuilderWindow:
         if not request:
             messagebox.showerror("再開できません", "元のアプリ案が run.json に残っていません。", parent=self.root)
             return
+        # A finished work does not change by "resuming" (all stages are
+        # reused as-is). Steer the user to the revision flow instead.
+        if str(manifest.get("status") or "") in ("completed", "completed_unapproved") \
+                and (run_dir / "index.html").is_file():
+            go_revision = messagebox.askyesno(
+                "この作品は完成しています",
+                "「つづき」は同じ指示文で残りの工程だけを行うため、出来上がりは変わりません。\n"
+                "直してほしい点がある場合は「ダメ出し」がおすすめです。\n\n"
+                "ダメ出しに進みますか？（いいえ＝それでも「つづき」を実行します）",
+                parent=self.root)
+            if go_revision:
+                self.goto_revision(run_dir, "welcome")
+                return
         try:
             validate_local_endpoint(self.endpoint_var.get())
             args, required = self._build_args_and_required()
@@ -1094,6 +1218,8 @@ class AppBuilderWindow:
         self.active_models = required
         self._apply_phase_names("build")
         self.current_phase = 0
+        self.activity_name = ""
+        self.qa_round = 0
         self.run_started_at = time.monotonic()
         self.last_activity_at = self.run_started_at
         for key, _e, _n, _r in DEPARTMENTS:
@@ -1263,20 +1389,17 @@ class AppBuilderWindow:
                     stage, chars = data
                     self.last_activity_at = time.monotonic()
                     if not (self.cancel_event is not None and self.cancel_event.is_set()):
-                        dept = {"requirements": "PM・要件定義", "design": "デザイン設計",
-                                "implementation": "実装", "qa": "QA・検査"}.get(stage, stage)
-                        if self.run_mode == "revision":
-                            dept = {"requirements": "元のアプリ確認", "design": "修正方針",
-                                    "implementation": "修正の実装", "qa": "QA・再検査"}.get(stage, dept)
-                        self.run_status.configure(text=f"{dept}が生成中… {chars}文字")
+                        activity = self.activity_name or {
+                            "requirements": "PM・要件定義", "design": "デザイン設計",
+                            "implementation": "実装", "qa": "QA・検査"}.get(stage, stage)
+                        self.run_status.configure(text=f"{activity}が生成中… {chars}文字")
                         if stage in self.phase_widgets:
                             self._set_phase(stage, "active", f"生成中… {chars}文字")
                         expected = {"requirements": 1500, "design": 2500,
                                     "implementation": 9000, "qa": 1500}.get(stage, 4000)
-                        base = self.current_phase * 100
-                        target = base + min(95, int(chars / expected * 100))
-                        if target > int(float(self.progress_bar["value"])):
-                            self.progress_bar.configure(value=target)
+                        # The bar tracks the CURRENT activity only, and never
+                        # sits at 100 while work continues (95% cap).
+                        self.progress_bar.configure(value=min(95, int(chars / expected * 100)))
                 elif kind == "output":
                     self.last_output = Path(data)
                 elif kind == "progress":
@@ -1331,6 +1454,11 @@ class AppBuilderWindow:
             pass
         self.root.after(150, self.process_events)
 
+    def _set_activity(self, name):
+        self.activity_name = name
+        self.progress_bar.configure(value=0)
+        self.run_status.configure(text=f"{name}…")
+
     def _handle_progress_line(self, line):
         index = progress_phase(line)
         if index is not None:
@@ -1341,17 +1469,24 @@ class AppBuilderWindow:
                     self._set_phase(key, "done")
                 elif pos == index:
                     self._set_phase(key, "active")
-            if int(float(self.progress_bar["value"])) < index * 100:
-                self.progress_bar.configure(value=index * 100)
-            if self.run_mode != "revision":
-                self.run_status.configure(text=f"{DEPARTMENTS[index][2]}の作業中です…")
-        if "[REPAIR]" in line:
-            self.run_status.configure(text="実装を自動で直しています…")
-            self._set_phase("implementation", "active", "自動修復中…")
-        if "[QA]" in line:
+            if self.run_mode == "revision":
+                names = ("元のアプリを確認中", "修正方針を立てています", "修正を実装中", "QAが再検査中")
+            else:
+                names = ("PM・要件定義が作成中", "デザイン設計が作成中", "実装が作成中", "QAが検査中")
+            self._set_activity(names[index])
+        review = re.search(r"\[QA\] レビュー (\d+)/(\d+)", line)
+        if review:
+            self.qa_round = int(review.group(1))
+            self._set_activity(f"QAレビュー {self.qa_round}回目")
             self._set_phase("qa", "active")
+        if "[QA] 指摘を実装部署で修正します" in line:
+            self._set_activity(f"差し戻し{max(self.qa_round, 1)}回目：修正中")
+            self._set_phase("implementation", "active", "差し戻しの修正中…")
+        if "[REPAIR]" in line:
+            self._set_activity("自動修復中")
+            self._set_phase("implementation", "active", "自動修復中…")
         if "[DONE]" in line:
-            self.progress_bar.configure(value=400)
+            self.progress_bar.configure(value=100)
 
     def _tick_clock(self):
         if self.busy and self.run_started_at:

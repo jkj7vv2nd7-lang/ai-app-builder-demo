@@ -527,5 +527,74 @@ class RevisionTests(unittest.TestCase):
 
 
 
+class ChangeHonestyTests(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model="test-model",
+            planning_model=None, design_model=None,
+            implementation_model=None, qa_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3, num_predict=256, num_ctx=2048, timeout=10,
+            max_qa_revisions=1, max_impl_repairs=2, browser_check=False,
+        )
+        self.html = (
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><main>Working app</main></body></html>"
+        )
+
+    def make_source(self, root):
+        source = Path(root) / "source_run"
+        source.mkdir()
+        (source / "index.html").write_text(self.html, encoding="utf-8")
+        (source / "run.json").write_text(
+            app_builder.json.dumps({"request": "メモ帳アプリ", "status": "completed"}),
+            encoding="utf-8")
+        return source
+
+    def test_pipeline_logs_the_request_text(self):
+        lines = []
+        responses = ["Requirements", "Design", self.html,
+                     "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    app_builder.run_pipeline(
+                        "時計アプリを作って", self.args, run_dir,
+                        progress_callback=lines.append)
+        self.assertTrue(any("今回の指示文" in line and "時計アプリを作って" in line
+                            for line in lines))
+
+    def test_revision_changed_flag_false_when_identical(self):
+        responses = ["方針", self.html, "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            source = self.make_source(root)
+            out_root = root / "out"; out_root.mkdir()
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code, new_run = app_builder.run_revision(
+                        source, "大きくして", self.args, out_root)
+            manifest = app_builder.json.loads((new_run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        self.assertIs(manifest["changed"], False)
+
+    def test_revision_changed_flag_true_when_modified(self):
+        revised = self.html.replace("Working app", "Working app v2")
+        responses = ["方針", revised, "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            source = self.make_source(root)
+            out_root = root / "out"; out_root.mkdir()
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code, new_run = app_builder.run_revision(
+                        source, "文言を変えて", self.args, out_root)
+            manifest = app_builder.json.loads((new_run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        self.assertIs(manifest["changed"], True)
+
+
+
 if __name__ == "__main__":
     unittest.main()
