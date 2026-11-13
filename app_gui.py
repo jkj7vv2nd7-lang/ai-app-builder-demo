@@ -8,8 +8,9 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 from urllib.parse import urlparse
 
 import app_builder
@@ -45,13 +46,22 @@ def fetch_ollama_models(endpoint, timeout=5):
         raise OllamaCheckError(str(exc)) from exc
 
 
+def fetch_ollama_model_details(endpoint, timeout=8):
+    try:
+        return app_builder.fetch_ollama_model_details(endpoint, timeout)
+    except app_builder.StageError as exc:
+        raise OllamaCheckError(str(exc)) from exc
+
+
+STAGE_KEYS = ("requirements", "design", "implementation", "qa")
+
+
 def selected_models(common_model, separate_models=None):
     common = common_model.strip() or app_builder.DEFAULT_MODEL
     separate = separate_models or {}
     return {
-        "planning": separate.get("planning", "").strip() or common,
-        "implementation": separate.get("implementation", "").strip() or common,
-        "qa": separate.get("qa", "").strip() or common,
+        key: (separate.get(key, "") or "").strip() or common
+        for key in STAGE_KEYS
     }
 
 
@@ -60,17 +70,16 @@ def build_run_args(
     common_model,
     stage_models,
     context_size,
-    routing_mode="single",
+    routing_mode="smart",
     timeout_seconds=600,
 ):
     validate_local_endpoint(endpoint)
-    if routing_mode == "auto" and any(
-        (stage_models or {}).get(key, "").strip()
-        for key in ("planning", "implementation", "qa")
+    if routing_mode not in {"smart", "single", "manual", "auto"}:
+        raise ValueError("モデルの使い方は「自動（部署ごとに切替）」「単一モデル」「部署ごとに手動」から選んでください。")
+    if routing_mode in {"smart", "auto"} and any(
+        (stage_models or {}).get(key, "").strip() for key in STAGE_KEYS
     ):
-        raise ValueError("自動ルーティングと工程別の手動指定は同時に使えません。")
-    if routing_mode not in {"single", "auto"}:
-        raise ValueError("モデルの使い方は「単一モデル」または「自動ルーティング」から選んでください。")
+        raise ValueError("自動モードと部署別の手動指定は同時に使えません。")
     if str(context_size) not in {"2048", "4096", "8192"}:
         raise ValueError("コンテキスト長は2048、4096、8192のいずれかを指定してください。")
     try:
@@ -80,33 +89,39 @@ def build_run_args(
     if timeout <= 0:
         raise ValueError("タイムアウトは1秒以上を指定してください。")
     parser = app_builder.build_parser()
+    builder_mode = routing_mode
     arguments = [
         "--endpoint", endpoint,
         "--model", common_model.strip() or app_builder.DEFAULT_MODEL,
         "--num-ctx", str(context_size),
         "--timeout", str(timeout_seconds),
-        "--routing-mode", routing_mode,
+        "--routing-mode", builder_mode,
     ]
-    for option, key in (
-        ("--planning-model", "planning"),
-        ("--implementation-model", "implementation"),
-        ("--qa-model", "qa"),
-    ) if routing_mode == "single" else ():
-        model = (stage_models or {}).get(key, "").strip()
-        if model:
-            arguments.extend((option, model))
+    if routing_mode == "manual":
+        for option, key in (
+            ("--planning-model", "requirements"),
+            ("--design-model", "design"),
+            ("--implementation-model", "implementation"),
+            ("--qa-model", "qa"),
+        ):
+            model = (stage_models or {}).get(key, "").strip()
+            if model:
+                arguments.extend((option, model))
     args = parser.parse_args(arguments)
     return args
 
 
-def models_for_mode(routing_mode, common_model, stage_models=None):
+def models_for_mode(routing_mode, common_model, stage_models=None, installed_details=None):
+    if routing_mode == "smart":
+        if installed_details:
+            assignments, _reasons, _suggestions = app_builder.smart_route_models(installed_details)
+            return assignments
+        return {key: "（接続確認後に自動決定）" for key in STAGE_KEYS}
     if routing_mode == "auto":
-        return {
-            "planning": app_builder.AUTO_MODEL_ROUTING["requirements"],
-            "implementation": app_builder.AUTO_MODEL_ROUTING["implementation"],
-            "qa": app_builder.AUTO_MODEL_ROUTING["qa"],
-        }
-    return selected_models(common_model, stage_models)
+        return dict(app_builder.AUTO_MODEL_ROUTING)
+    if routing_mode == "manual":
+        return selected_models(common_model, stage_models)
+    return selected_models(common_model, None)
 
 
 def missing_models(required_models, installed_models):
@@ -204,20 +219,22 @@ class AppBuilderWindow:
         self.last_output = None
         self.output_ready = False
         self.installed_models = None
+        self.installed_details = None
+        self.cancel_event = None
         self.active_models = {}
         self.input_controls = []
 
-        root.title("AIアプリ開発エージェント")
+        root.title("AIアプリ開発エージェント v2")
         root.geometry("840x900")
         root.minsize(720, 740)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         outer = ttk.Frame(root, padding=16)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="AIアプリ開発エージェント", font=("", 18, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="AIアプリ開発エージェント v2", font=("", 18, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="アイデアを入力して開始します。処理中も画面は操作可能で、成果物は専用フォルダーに保存されます。",
+            text="アイデアを入力して開始します。部署（PM・設計・実装・QA）ごとに最適なモデルへ自動で切り替わり、生成は途中で止まらず進み具合が見えます。失敗しても自動で直し、途中成果はいつも保存されます。",
             wraplength=770,
         ).pack(anchor="w", pady=(4, 12))
 
@@ -254,33 +271,30 @@ class AppBuilderWindow:
         )
         self.input_controls.append(self.model_entry)
         self.separate_var = tk.BooleanVar(value=False)
-        separate_check = ttk.Checkbutton(
+        ttk.Label(
             settings,
-            text="工程別にモデルを指定する",
-            variable=self.separate_var,
-            command=self.toggle_stage_models,
-        )
-        separate_check.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 4))
-        self.input_controls.append(separate_check)
+            text="部署ごとのモデル（「部署ごとに手動」を選んだときだけ有効。一覧から選べます）",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 4))
 
         self.stage_model_vars = {
-            "planning": tk.StringVar(),
+            "requirements": tk.StringVar(),
+            "design": tk.StringVar(),
             "implementation": tk.StringVar(),
             "qa": tk.StringVar(),
         }
         self.stage_model_entries = {}
         for row, (key, label) in enumerate(
-            (("planning", "要件・設計"), ("implementation", "実装"), ("qa", "QA")),
+            (("requirements", "PM・要件定義"), ("design", "デザイン設計"), ("implementation", "実装"), ("qa", "QA")),
             start=4,
         ):
             ttk.Label(settings, text=f"  {label}").grid(row=row, column=0, sticky="w")
-            entry = ttk.Entry(settings, textvariable=self.stage_model_vars[key], width=36, state="disabled")
+            entry = ttk.Combobox(settings, textvariable=self.stage_model_vars[key], width=34, state="disabled")
             entry.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
             self.stage_model_entries[key] = entry
             self.input_controls.append(entry)
-            ttk.Label(settings, text="空欄なら既定モデルを使用").grid(row=row, column=2, sticky="w")
+            ttk.Label(settings, text="空欄なら単一モデルを使用").grid(row=row, column=2, sticky="w")
 
-        ttk.Label(settings, text="コンテキスト").grid(row=7, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(settings, text="コンテキスト").grid(row=8, column=0, sticky="w", pady=(8, 0))
         self.context_var = tk.StringVar(value="4096")
         context_combo = ttk.Combobox(
             settings,
@@ -289,35 +303,43 @@ class AppBuilderWindow:
             width=12,
             state="readonly",
         )
-        context_combo.grid(row=7, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+        context_combo.grid(row=8, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
         self.input_controls.append(context_combo)
-        ttk.Label(settings, text="タイムアウト（秒）").grid(row=8, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(settings, text="タイムアウト（秒）").grid(row=9, column=0, sticky="w", pady=(6, 0))
         self.timeout_var = tk.StringVar(value="600")
         timeout_entry = ttk.Entry(settings, textvariable=self.timeout_var, width=12)
-        timeout_entry.grid(row=8, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        timeout_entry.grid(row=9, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
         self.input_controls.append(timeout_entry)
         settings.columnconfigure(1, weight=1)
 
         routing = ttk.LabelFrame(outer, text="3. モデルの使い方", padding=8)
         routing.pack(fill="x", pady=(8, 0))
-        self.routing_var = tk.StringVar(value="single")
+        self.routing_var = tk.StringVar(value="smart")
+        smart_radio = ttk.Radiobutton(
+            routing,
+            text="自動で部署ごとに切替（おすすめ）",
+            value="smart",
+            variable=self.routing_var,
+            command=self.on_routing_changed,
+        )
+        smart_radio.pack(side="left")
         single_radio = ttk.Radiobutton(
             routing,
-            text="単一モデル（既定）",
+            text="単一モデル",
             value="single",
             variable=self.routing_var,
             command=self.on_routing_changed,
         )
-        single_radio.pack(side="left")
-        auto_radio = ttk.Radiobutton(
+        single_radio.pack(side="left", padx=(12, 0))
+        manual_radio = ttk.Radiobutton(
             routing,
-            text="おすすめ自動ルーティング",
-            value="auto",
+            text="部署ごとに手動で選ぶ",
+            value="manual",
             variable=self.routing_var,
             command=self.on_routing_changed,
         )
-        auto_radio.pack(side="left", padx=(12, 0))
-        self.input_controls.extend((single_radio, auto_radio))
+        manual_radio.pack(side="left", padx=(12, 0))
+        self.input_controls.extend((smart_radio, single_radio, manual_radio))
         self.routing_summary = tk.StringVar()
         ttk.Label(routing, textvariable=self.routing_summary, wraplength=770).pack(
             anchor="w", pady=(6, 0)
@@ -325,9 +347,9 @@ class AppBuilderWindow:
 
         ttk.Label(
             outer,
-            text="自動ルーティングは役割ごとの固定モデル表を使います（ベンチマークによる自動探索ではありません）。"
-            "必要なモデルがない場合は開始せず、ollama pull の案内を表示します。"
-            "モデルはAPI呼び出し後にアンロードされるため、各工程の開始時に再ロード待ちが発生する場合があります。",
+            text="自動モードでは、導入済みのモデルの中から部署ごとに得意なものを選びます（PM・設計は日本語と推論が得意な汎用モデル、実装・QAはコード特化モデルを優先）。"
+            "理想のモデルが無くても、今あるモデルの中で最適な割り当てで続行します。"
+            "モデルは各工程の後にアンロードされるため、切替時に少しロード待ちがあります（16GBメモリを守るためです）。",
             wraplength=780,
         ).pack(anchor="w", pady=(8, 8))
 
@@ -335,8 +357,16 @@ class AppBuilderWindow:
         action_row.pack(fill="x")
         self.start_button = ttk.Button(action_row, text="アプリを作成", command=self.start_generation)
         self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(action_row, text="中止", command=self.stop_generation, state="disabled")
+        self.stop_button.pack(side="left", padx=(8, 0))
+        self.preview_button = ttk.Button(action_row, text="生成アプリを開く", command=self.preview_output, state="disabled")
+        self.preview_button.pack(side="left", padx=(8, 0))
+        self.resume_button = ttk.Button(action_row, text="つづきから再開", command=self.resume_generation)
+        self.resume_button.pack(side="left", padx=(8, 0))
         self.open_button = ttk.Button(action_row, text="出力フォルダーを開く", command=self.open_output, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
+        self.progress_bar = ttk.Progressbar(outer, mode="determinate", maximum=4, value=0)
+        self.progress_bar.pack(fill="x", pady=(8, 0))
         self.status_var = tk.StringVar(value="準備中")
         ttk.Label(action_row, textvariable=self.status_var).pack(side="left", padx=(12, 0))
 
@@ -402,41 +432,40 @@ class AppBuilderWindow:
         self.root.after(250, self.check_connection)
 
     def toggle_stage_models(self):
-        state = "normal" if self.separate_var.get() and self.routing_var.get() == "single" else "disabled"
+        state = "normal" if self.routing_var.get() == "manual" and not self.busy else "disabled"
         for entry in self.stage_model_entries.values():
             entry.configure(state=state)
 
     def on_routing_changed(self):
-        is_auto = self.routing_var.get() == "auto"
+        is_auto = self.routing_var.get() in {"smart", "auto"}
         self.model_entry.configure(state="disabled" if is_auto or self.busy else "normal")
         for entry in self.stage_model_entries.values():
-            enabled = self.separate_var.get() and not is_auto and not self.busy
+            enabled = self.routing_var.get() == "manual" and not self.busy
             entry.configure(state="normal" if enabled else "disabled")
         self.refresh_routing_summary()
 
     def refresh_routing_summary(self):
-        stage_models = {
-            key: value.get()
-            for key, value in self.stage_model_vars.items()
-        } if self.separate_var.get() else None
-        models = models_for_mode(
-            self.routing_var.get(),
-            self.model_var.get(),
-            stage_models,
-        )
+        stage_models = {key: value.get() for key, value in self.stage_model_vars.items()}
+        try:
+            models = models_for_mode(
+                self.routing_var.get(),
+                self.model_var.get(),
+                stage_models,
+                installed_details=self.installed_details,
+            )
+        except Exception:
+            models = {key: "（未決定）" for key in STAGE_KEYS}
         self.routing_summary.set(
-            f"開始前の割当 — 要件・設計: {models['planning']} / "
+            f"開始前の割当 — PM・要件: {models['requirements']} / 設計: {models['design']} / "
             f"実装: {models['implementation']} / QA: {models['qa']}"
         )
         if self.installed_models is not None:
-            absent = missing_models(models, self.installed_models)
-            if absent:
-                status = "必要モデル未導入: " + ", ".join(absent)
+            if self.routing_var.get() == "smart":
+                status = "自動モード: 導入済みモデルから部署ごとに割り当てます。"
             else:
-                status = "選択中のモデルは利用可能です。"
-            self.model_status.configure(
-                text=f"Ollama接続済み。{status}"
-            )
+                absent = missing_models(models, self.installed_models)
+                status = ("必要モデル未導入: " + ", ".join(absent)) if absent else "選択中のモデルは利用可能です。"
+            self.model_status.configure(text=f"Ollama接続済み。{status}")
 
     def append_log(self, text):
         self.log_text.configure(state="normal")
@@ -448,14 +477,18 @@ class AppBuilderWindow:
         self.busy = busy
         self.start_button.configure(state="disabled" if busy else "normal")
         self.check_button.configure(state="disabled" if busy else "normal")
+        if hasattr(self, "stop_button"):
+            self.stop_button.configure(state="normal" if busy else "disabled")
+        if hasattr(self, "resume_button"):
+            self.resume_button.configure(state="disabled" if busy else "normal")
         self.publish_button.configure(state="disabled")
         for control in self.input_controls:
             if isinstance(control, scrolledtext.ScrolledText):
                 control.configure(state="disabled" if busy else "normal")
-            elif isinstance(control, ttk.Combobox):
-                control.configure(state="disabled" if busy else "readonly")
             elif control in self.stage_model_entries.values():
                 control.configure(state="disabled")
+            elif isinstance(control, ttk.Combobox):
+                control.configure(state="disabled" if busy else "readonly")
             elif control is self.model_entry:
                 control.configure(state="disabled" if busy else "normal")
             else:
@@ -491,10 +524,31 @@ class AppBuilderWindow:
 
     def _check_worker(self, endpoint):
         try:
-            models = fetch_ollama_models(endpoint)
-            self.events.put(("models", models))
+            details = fetch_ollama_model_details(endpoint)
+            self.events.put(("models", details))
         except Exception as exc:
             self.events.put(("check_error", str(exc)))
+
+    def _build_args_and_required(self):
+        stage_values = (
+            {key: value.get() for key, value in self.stage_model_vars.items()}
+            if self.routing_var.get() == "manual" else {}
+        )
+        args = build_run_args(
+            self.endpoint_var.get().strip(),
+            self.model_var.get(),
+            stage_values,
+            self.context_var.get(),
+            self.routing_var.get(),
+            self.timeout_var.get(),
+        )
+        required = models_for_mode(
+            args.routing_mode,
+            args.model,
+            stage_values,
+            installed_details=self.installed_details,
+        )
+        return args, required
 
     def start_generation(self):
         try:
@@ -509,31 +563,13 @@ class AppBuilderWindow:
             return
         try:
             validate_local_endpoint(self.endpoint_var.get())
-            args = build_run_args(
-                self.endpoint_var.get().strip(),
-                self.model_var.get(),
-                {key: value.get() for key, value in self.stage_model_vars.items()}
-                if self.separate_var.get() and self.routing_var.get() == "single"
-                else None,
-                self.context_var.get(),
-                self.routing_var.get(),
-                self.timeout_var.get(),
-            )
-            required = models_for_mode(
-                args.routing_mode,
-                args.model,
-                {
-                    "planning": args.planning_model or "",
-                    "implementation": args.implementation_model or "",
-                    "qa": args.qa_model or "",
-                },
-            )
-            if self.separate_var.get() and self.routing_var.get() == "single" and any(
+            args, required = self._build_args_and_required()
+            if self.routing_var.get() == "manual" and any(
                 not value.get().strip() for value in self.stage_model_vars.values()
             ):
                 messagebox.showinfo(
-                    "工程別モデル設定",
-                    "空欄の工程には既定モデルを使います。\n別モデルを使う工程には、Ollamaのモデル一覧にある正確な名前を入力してください。",
+                    "部署別モデル設定",
+                    "空欄の部署には単一モデル欄のモデルを使います。",
                     parent=self.root,
                 )
         except (ValueError, SystemExit) as exc:
@@ -541,7 +577,48 @@ class AppBuilderWindow:
                 return
             messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
             return
+        self._begin_run(request, required, args, resume_dir=None)
 
+    def resume_generation(self):
+        if self.busy:
+            return
+        runs_root = Path(__file__).resolve().parent / "runs"
+        chosen = filedialog.askdirectory(
+            title="再開する実行フォルダーを選んでください（run.json のあるフォルダー）",
+            initialdir=str(runs_root) if runs_root.exists() else str(Path(__file__).resolve().parent),
+            parent=self.root,
+        )
+        if not chosen:
+            return
+        run_dir = Path(chosen)
+        manifest_path = run_dir / "run.json"
+        if not manifest_path.is_file():
+            messagebox.showerror("再開できません", "選んだフォルダーに run.json がありません。実行フォルダーそのものを選んでください。", parent=self.root)
+            return
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            request = str(manifest.get("request") or "").strip()
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("再開できません", f"run.json を読めません: {exc}", parent=self.root)
+            return
+        if not request:
+            messagebox.showerror("再開できません", "元のアプリ案が run.json に残っていません。", parent=self.root)
+            return
+        try:
+            validate_local_endpoint(self.endpoint_var.get())
+            args, required = self._build_args_and_required()
+        except (ValueError, SystemExit) as exc:
+            if isinstance(exc, SystemExit):
+                return
+            messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
+            return
+        self.request_text.delete("1.0", "end")
+        self.request_text.insert("1.0", request)
+        self.append_log(f"再開します: {run_dir}")
+        self._begin_run(request, required, args, resume_dir=run_dir)
+
+    def _begin_run(self, request, required, args, resume_dir):
+        self.cancel_event = threading.Event()
         self.set_busy(True, "接続とモデルを事前確認中...")
         self.output_ready = False
         self.publication_reviewed_var.set(False)
@@ -549,33 +626,58 @@ class AppBuilderWindow:
         self.active_models = required
         self.model_status.configure(text="実行に必要なモデルを確認しています...")
         self.append_log("入力を受け付けました。Ollama接続と必要モデルを確認します。")
-        for phase in PHASES:
-            self.phase_vars[phase].set(f"○ {phase}")
+        self.progress_bar.configure(value=0)
+        stage_keys = STAGE_KEYS
+        for position, phase in enumerate(PHASES):
+            model_name = required.get(stage_keys[position], "")
+            self.phase_vars[phase].set(f"○ {phase}" + (f" — {model_name}" if model_name and "自動決定" not in model_name else ""))
         threading.Thread(
             target=self._generation_worker,
-            args=(request, required, args),
+            args=(request, required, args, resume_dir),
             daemon=True,
         ).start()
 
-    def _generation_worker(self, request, required, args):
+    def _generation_worker(self, request, required, args, resume_dir=None):
         try:
-            installed = fetch_ollama_models(args.endpoint)
-            absent = missing_models(required, installed)
-            if absent:
-                self.events.put(("missing_models", (absent, installed)))
-                return
-            output_root = app_builder.resolve_output_root("runs")
-            run_dir = app_builder.create_run_directory(output_root)
+            if resume_dir is not None:
+                run_dir = Path(resume_dir)
+            else:
+                if args.routing_mode != "smart":
+                    installed = fetch_ollama_models(args.endpoint)
+                    absent = missing_models(required, installed)
+                    if absent:
+                        self.events.put(("missing_models", (absent, installed)))
+                        return
+                output_root = app_builder.resolve_output_root("runs")
+                run_dir = app_builder.create_run_directory(output_root)
             self.events.put(("output", str(run_dir)))
             exit_code = app_builder.run_pipeline(
                 request,
                 args,
                 run_dir,
                 progress_callback=lambda line: self.events.put(("progress", line)),
+                token_callback=lambda stage, chars: self.events.put(("tokens", (stage, chars))),
+                cancel_event=self.cancel_event,
+                resume=resume_dir is not None,
             )
             self.events.put(("finished", (exit_code, str(run_dir))))
         except Exception as exc:
             self.events.put(("worker_error", str(exc)))
+
+    def stop_generation(self):
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+            self.status_var.set("中止しています…（現在の文字の区切りで止まります）")
+            self.append_log("中止ボタンが押されました。完了済みの工程は保存されています。")
+
+    def preview_output(self):
+        if not self.last_output:
+            return
+        html_path = Path(self.last_output) / "index.html"
+        if not html_path.is_file():
+            messagebox.showinfo("生成アプリ", "まだ index.html がありません。", parent=self.root)
+            return
+        webbrowser.open(html_path.resolve().as_uri())
 
     def start_publication(self):
         if self.busy:
@@ -664,17 +766,28 @@ class AppBuilderWindow:
             while True:
                 kind, data = self.events.get_nowait()
                 if kind == "models":
-                    self.installed_models = data
+                    if data and isinstance(data[0], dict):
+                        self.installed_details = data
+                        self.installed_models = [item["name"] for item in data]
+                    else:
+                        self.installed_models = list(data)
+                        self.installed_details = [{"name": name, "size": 0, "details": {}} for name in self.installed_models]
+                    names = self.installed_models
+                    for combo in self.stage_model_entries.values():
+                        combo.configure(values=names)
                     self.refresh_routing_summary()
-                    absent = missing_models(
-                        models_for_mode(
-                            self.routing_var.get(),
-                            self.model_var.get(),
-                            {key: value.get() for key, value in self.stage_model_vars.items()}
-                            if self.separate_var.get() else None,
-                        ),
-                        data,
-                    )
+                    if self.routing_var.get() == "smart":
+                        absent = [] if names else ["（モデルが1つも導入されていません）"]
+                    else:
+                        absent = missing_models(
+                            models_for_mode(
+                                self.routing_var.get(),
+                                self.model_var.get(),
+                                {key: value.get() for key, value in self.stage_model_vars.items()},
+                                installed_details=self.installed_details,
+                            ),
+                            names,
+                        )
                     self.set_busy(False, "準備完了" if not absent else "モデルを導入してください")
                     self.append_log("Ollama接続を確認しました。")
                     if absent:
@@ -699,6 +812,11 @@ class AppBuilderWindow:
                     self.append_log(advice)
                     messagebox.showerror("モデルが見つかりません", advice, parent=self.root)
                     self.set_busy(False, "モデルを導入後に再実行してください")
+                elif kind == "tokens":
+                    stage, chars = data
+                    label = {"requirements": "PM・要件定義", "design": "デザイン設計", "implementation": "実装", "qa": "QA"}.get(stage, stage)
+                    if not (self.cancel_event is not None and self.cancel_event.is_set()):
+                        self.status_var.set(f"{label}を生成中… {chars}文字")
                 elif kind == "output":
                     self.last_output = Path(data)
                     self.open_button.configure(state="normal")
@@ -710,9 +828,14 @@ class AppBuilderWindow:
                     code, output = data
                     self.last_output = Path(output)
                     self.open_button.configure(state="normal")
+                    self.preview_button.configure(state="normal" if (self.last_output / "index.html").is_file() else "disabled")
                     self.output_ready = code in (0, 2) and (self.last_output / "index.html").is_file()
                     self.set_busy(False)
-                    if code == 0:
+                    if code == 3:
+                        self.status_var.set("中止しました（途中成果は保存済み・再開できます）")
+                        self.progress_bar.configure(value=0)
+                        self.append_log(f"中止しました。保存先: {output}。「つづきから再開」で続きを実行できます。")
+                    elif code == 0:
                         self.status_var.set("完了（AI QA承認）")
                         self.append_log(f"完了しました。保存先: {output}")
                     elif code == 2:
@@ -781,7 +904,7 @@ class AppBuilderWindow:
     def update_progress(self, line):
         index = progress_phase(line)
         if index is not None:
-            phase_model_key = ("planning", "planning", "implementation", "qa")[index]
+            phase_model_key = ("requirements", "design", "implementation", "qa")[index]
             phase_model = self.active_models.get(phase_model_key, "")
             for position, phase in enumerate(PHASES):
                 if position < index:
@@ -797,7 +920,10 @@ class AppBuilderWindow:
                 if phase_model
                 else f"{PHASES[index]}を処理中..."
             )
+        if index is not None:
+            self.progress_bar.configure(value=index + 1)
         if "[DONE]" in line:
+            self.progress_bar.configure(value=4)
             for phase in PHASES:
                 self.phase_vars[phase].set(f"✓ {phase}")
 
@@ -839,11 +965,14 @@ class AppBuilderWindow:
 
     def on_close(self):
         if self.busy:
-            messagebox.showinfo(
-                "処理中です",
-                "生成または接続確認の処理中は終了できません。\n完了してから閉じてください。",
-                parent=self.root,
-            )
+            if self.cancel_event is not None and not self.cancel_event.is_set():
+                self.cancel_event.set()
+                messagebox.showinfo(
+                    "中止して終了します",
+                    "生成を中止します。完了済みの工程は保存されており、次回「つづきから再開」できます。",
+                    parent=self.root,
+                )
+            self.root.destroy()
             return
         self.root.destroy()
 

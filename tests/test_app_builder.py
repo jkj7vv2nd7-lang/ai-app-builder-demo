@@ -92,11 +92,12 @@ class OutputAndApiTests(unittest.TestCase):
         args = SimpleNamespace(
             model="common-model",
             planning_model="planning-model",
+            design_model="design-model",
             implementation_model="implementation-model",
             qa_model=None,
         )
         self.assertEqual(app_builder.selected_model(args, "requirements"), "planning-model")
-        self.assertEqual(app_builder.selected_model(args, "design"), "planning-model")
+        self.assertEqual(app_builder.selected_model(args, "design"), "design-model")
         self.assertEqual(app_builder.selected_model(args, "implementation"), "implementation-model")
         self.assertEqual(app_builder.selected_model(args, "qa"), "common-model")
 
@@ -124,19 +125,63 @@ class OutputAndApiTests(unittest.TestCase):
         self.assertEqual(args.model, "qwen2.5-coder:7b")
         self.assertEqual(args.num_ctx, 4096)
         self.assertFalse(args.browser_check)
-        self.assertEqual(args.routing_mode, "single")
+        self.assertEqual(args.routing_mode, "smart")
+        self.assertTrue(args.stream)
+        self.assertEqual(args.max_impl_repairs, 2)
 
     def test_auto_routing_uses_fixed_role_models(self):
         args = app_builder.build_parser().parse_args(["--routing-mode", "auto", "sample app"])
         models = app_builder.models_for_run(args)
-        self.assertEqual(models["planning"], "qwen3:8b")
+        self.assertEqual(models["requirements"], "qwen3:8b")
+        self.assertEqual(models["design"], "qwen3:8b")
         self.assertEqual(models["implementation"], "qwen2.5-coder:7b")
         self.assertEqual(models["qa"], "qwen2.5-coder:7b")
+
+    def test_smart_routing_assigns_best_installed_model_per_department(self):
+        details = [
+            {"name": "qwen3:8b", "size": 5_200_000_000, "details": {"parameter_size": "8B"}},
+            {"name": "qwen2.5-coder:7b", "size": 4_700_000_000, "details": {"parameter_size": "7B"}},
+            {"name": "llama3.1:8b", "size": 4_900_000_000, "details": {"parameter_size": "8B"}},
+        ]
+        assignments, reasons, suggestions = app_builder.smart_route_models(details)
+        self.assertEqual(assignments["requirements"], "qwen3:8b")
+        self.assertEqual(assignments["design"], "qwen3:8b")
+        self.assertEqual(assignments["implementation"], "qwen2.5-coder:7b")
+        self.assertEqual(assignments["qa"], "qwen2.5-coder:7b")
+        self.assertEqual(suggestions, [])
+        self.assertIn("コード特化", reasons["implementation"])
+
+    def test_smart_routing_with_one_model_uses_it_everywhere_and_suggests_ideals(self):
+        details = [{"name": "qwen2.5-coder:3b", "size": 1_900_000_000, "details": {"parameter_size": "3B"}}]
+        assignments, _reasons, suggestions = app_builder.smart_route_models(details)
+        self.assertTrue(all(name == "qwen2.5-coder:3b" for name in assignments.values()))
+        self.assertIn("ollama pull qwen3:8b", suggestions)
+
+    def test_smart_routing_requires_at_least_one_model(self):
+        with self.assertRaises(app_builder.StageError):
+            app_builder.smart_route_models([])
+
+    def test_generation_options_give_implementation_a_bigger_budget(self):
+        args = app_builder.build_parser().parse_args(["sample app"])
+        impl = app_builder.generation_options(args, "implementation")
+        qa = app_builder.generation_options(args, "qa")
+        self.assertGreaterEqual(impl["num_predict"], 8192)
+        self.assertGreaterEqual(impl["num_ctx"], 8192)
+        self.assertLessEqual(qa["num_predict"], 2048)
 
     def test_auto_routing_requires_explicit_installation_instead_of_fallback(self):
         required = app_gui.models_for_mode("auto", "single-model")
         missing = app_gui.missing_models(required, ["single-model"])
         self.assertEqual(missing, ["qwen2.5-coder:7b", "qwen3:8b"])
+
+    def test_smart_mode_in_gui_uses_installed_details(self):
+        details = [
+            {"name": "qwen3:8b", "size": 5_200_000_000, "details": {"parameter_size": "8B"}},
+            {"name": "qwen2.5-coder:7b", "size": 4_700_000_000, "details": {"parameter_size": "7B"}},
+        ]
+        models = app_gui.models_for_mode("smart", "ignored", installed_details=details)
+        self.assertEqual(models["requirements"], "qwen3:8b")
+        self.assertEqual(models["implementation"], "qwen2.5-coder:7b")
 
     def test_auto_routing_cli_stops_with_pull_advice_when_model_is_missing(self):
         error_stream = io.StringIO()
@@ -146,8 +191,20 @@ class OutputAndApiTests(unittest.TestCase):
             code = app_builder.main(["--routing-mode", "auto", "sample app"])
         self.assertEqual(code, 1)
         self.assertIn("ollama pull qwen3:8b", error_stream.getvalue())
-        self.assertIn("単一モデル", error_stream.getvalue())
+        self.assertIn("smart", error_stream.getvalue())
         create_run.assert_not_called()
+
+    def test_smart_cli_resolves_models_from_installed_details(self):
+        details = [{"name": "qwen2.5-coder:7b", "size": 4_700_000_000, "details": {"parameter_size": "7B"}}]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "fetch_ollama_model_details", return_value=details), \
+                 patch.object(app_builder, "create_run_directory", return_value=run_dir), \
+                 patch.object(app_builder, "run_pipeline", return_value=0) as run_pipeline:
+                code = app_builder.main(["sample app"])
+        self.assertEqual(code, 0)
+        used_args = run_pipeline.call_args.args[1]
+        self.assertEqual(used_args.resolved_models["implementation"], "qwen2.5-coder:7b")
 
     def test_auto_routing_cli_runs_only_after_both_models_are_present(self):
         with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
@@ -162,6 +219,7 @@ class OutputAndApiTests(unittest.TestCase):
                 code = app_builder.main(["--routing-mode", "auto", "sample app"])
         self.assertEqual(code, 0)
         self.assertEqual(run_pipeline.call_args.args[1].routing_mode, "auto")
+        self.assertEqual(run_pipeline.call_args.args[0], "sample app")
 
     @patch.object(app_builder.urllib.request, "urlopen")
     def test_local_model_check_reads_ollama_tags(self, urlopen):
@@ -179,25 +237,42 @@ class OutputAndApiTests(unittest.TestCase):
         args = app_gui.build_run_args(
             "http://localhost:11434/api/generate",
             "one-model",
-            {"planning": "planner", "implementation": "", "qa": ""},
+            {"requirements": "", "design": "", "implementation": "", "qa": ""},
             4096,
+            routing_mode="single",
             timeout_seconds=1200,
         )
         self.assertEqual(app_builder.models_for_run(args), {
-            "planning": "planner",
+            "requirements": "one-model",
+            "design": "one-model",
             "implementation": "one-model",
             "qa": "one-model",
         })
         self.assertEqual(args.timeout, 1200)
+
+    def test_manual_mode_assigns_each_department_separately(self):
+        args = app_gui.build_run_args(
+            "http://localhost:11434/api/generate",
+            "one-model",
+            {"requirements": "pm-model", "design": "design-model", "implementation": "coder-model", "qa": "qa-model"},
+            4096,
+            routing_mode="manual",
+        )
+        self.assertEqual(app_builder.models_for_run(args), {
+            "requirements": "pm-model",
+            "design": "design-model",
+            "implementation": "coder-model",
+            "qa": "qa-model",
+        })
 
     def test_auto_routing_disallows_hidden_manual_overrides(self):
         with self.assertRaises(ValueError):
             app_gui.build_run_args(
                 "http://localhost:11434/api/generate",
                 "one-model",
-                {"planning": "planner"},
+                {"requirements": "planner"},
                 4096,
-                routing_mode="auto",
+                routing_mode="smart",
             )
 
     def test_gui_reports_invalid_timeout_as_a_form_error(self):
@@ -292,18 +367,63 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(manifest["status"], "completed")
         self.assertTrue(manifest["qa_approved"])
-        self.assertEqual(manifest["models"]["planning"], "test-model")
+        self.assertEqual(manifest["models"]["requirements"], "test-model")
         self.assertEqual(manifest["browser_check"]["status"], "skipped")
         self.assertIn("<main>", saved_html)
 
-    def test_qa_without_html_preserves_valid_code_as_unapproved(self):
+    def test_qa_review_only_approval_completes_pipeline(self):
+        # v2: QA returns a verdict only; approval no longer needs HTML back.
         exit_code, manifest, saved_html = self.run_pipeline_with_responses(
-            "QA_STATUS: APPROVED\nEverything looks fine."
+            "QA_STATUS: APPROVED\nDEFECTS:\n- なし"
         )
-        self.assertEqual(exit_code, 2)
-        self.assertEqual(manifest["status"], "completed_unapproved")
-        self.assertFalse(manifest["qa_approved"])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(manifest["status"], "completed")
+        self.assertTrue(manifest["qa_approved"])
         self.assertIn("<main>", saved_html)
+
+    def test_qa_revision_is_repaired_by_implementation_then_approved(self):
+        responses = [
+            "Requirements", "Design", self.html,
+            "QA_STATUS: NEEDS_REVISION\nDEFECTS:\n- 保存ボタンが動かない",
+            self.html.replace("Working app", "Working app fixed"),
+            "QA_STATUS: APPROVED\nDEFECTS:\n- なし",
+        ]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exit_code = app_builder.run_pipeline("Test app", self.args, run_dir)
+            saved_html = (run_dir / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(exit_code, 0)
+        self.assertIn("fixed", saved_html)
+
+    def test_broken_first_implementation_is_repaired_instead_of_aborting(self):
+        broken = "<html><head></head><body></body></html>"
+        responses = [
+            "Requirements", "Design", broken, self.html,
+            "QA_STATUS: APPROVED\nDEFECTS:\n- なし",
+        ]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exit_code = app_builder.run_pipeline("Test app", self.args, run_dir)
+            saved_html = (run_dir / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(exit_code, 0)
+        self.assertIn("<main>", saved_html)
+
+    def test_resume_skips_completed_stages(self):
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            (run_dir / "01_requirements.md").write_text("Saved requirements\n", encoding="utf-8")
+            (run_dir / "02_design.md").write_text("Saved design\n", encoding="utf-8")
+            (run_dir / "run.json").write_text("{\"request\": \"Test app\"}", encoding="utf-8")
+            responses = [self.html, "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+            with patch.object(app_builder, "call_ollama", side_effect=responses) as call_mock:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exit_code = app_builder.run_pipeline("Test app", self.args, run_dir, resume=True)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(call_mock.call_count, 2)
 
 
 if __name__ == "__main__":
