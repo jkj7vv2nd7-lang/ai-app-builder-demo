@@ -1,21 +1,99 @@
 #!/usr/bin/env python3
 """Tkinter desktop interface for the local Ollama app builder."""
 
+import io
 import json
+import math
 import os
 import queue
 import re
 import time
+import struct
 import subprocess
 import sys
 import threading
 import tkinter as tk
+import wave
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from urllib.parse import urlparse
 
 import app_builder
+
+
+def _synth_wav_bytes(notes, volume=0.42, rate=22050):
+    """Build a small chime in code (no bundled audio files needed).
+
+    notes: list of (frequency_hz, seconds). Each note rings with an
+    exponential decay, like a microwave / oven timer bell.
+    """
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        frames = bytearray()
+        for freq, seconds in notes:
+            count = int(rate * seconds)
+            for i in range(count):
+                t = i / rate
+                envelope = math.exp(-3.2 * i / max(count, 1))
+                value = (math.sin(2 * math.pi * freq * t)
+                         + 0.35 * math.sin(2 * math.pi * freq * 2 * t)
+                         + 0.12 * math.sin(2 * math.pi * freq * 3 * t))
+                frames += struct.pack("<h", int(32767 * volume * envelope * value / 1.47))
+        wav.writeframes(bytes(frames))
+    return buffer.getvalue()
+
+
+_CHIME_CACHE = {}
+
+
+def play_chime(kind="success"):
+    """Play the completion chime on Windows via winsound (stdlib, reliable).
+
+    success: bright two-note 「チーン♪」. failed: softer descending tones.
+    On non-Windows systems this quietly does nothing.
+    """
+    if sys.platform != "win32":
+        return False
+
+    def _play():
+        try:
+            import winsound
+            if kind not in _CHIME_CACHE:
+                if kind == "success":
+                    _CHIME_CACHE[kind] = _synth_wav_bytes(
+                        [(1567.98, 0.5), (2093.00, 0.85)])
+                else:
+                    _CHIME_CACHE[kind] = _synth_wav_bytes(
+                        [(523.25, 0.26), (392.00, 0.42)], volume=0.28)
+            winsound.PlaySound(_CHIME_CACHE[kind], winsound.SND_MEMORY)
+        except Exception:
+            try:
+                import winsound
+                if kind == "success":
+                    winsound.Beep(1568, 220)
+                    winsound.Beep(2093, 380)
+                else:
+                    winsound.Beep(523, 180)
+                    winsound.Beep(392, 280)
+            except Exception:
+                pass
+
+    threading.Thread(target=_play, daemon=True).start()
+    return True
+
+
+def _mix_color(color_from, color_to, ratio):
+    """Interpolate between two #rrggbb colors."""
+    def parts(color):
+        return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+    a, b = parts(color_from), parts(color_to)
+    mixed = tuple(int(x + (y - x) * max(0.0, min(1.0, ratio))) for x, y in zip(a, b))
+    return "#%02x%02x%02x" % mixed
+
 import github_publish
 
 
@@ -276,6 +354,9 @@ class AppBuilderWindow:
         self.revision_return = "welcome"
         self.external_folder = None
         self.external_info = None
+        self.sound_var = tk.BooleanVar(value=True)
+        self.oven_frame = 0
+        self._oven_job = None
         self.activity_name = ""
         self.qa_round = 0
         self._fonts = []
@@ -318,10 +399,12 @@ class AppBuilderWindow:
             ("publish", self._page_publish),
             ("settings", self._page_settings),
         ):
-            if name in ("welcome", "models"):
+            if name in ("welcome", "models", "run"):
                 # v3.4: 内容がウィンドウの高さを超える画面はスクロール可能にする。
                 # 固定 1060x830 のままでは、作品が増えた最初の画面や
                 # 文字を大きくした2番目の画面で一番下が見えなくなるため。
+                # v3.5: 作成中画面にもオーブンの演出が加わり高さが増えたため、
+                # 同じ理由でスクロール可能にした（下のトグルやログが切れないように）。
                 frame = self._scrollable_page(name, builder)
             else:
                 frame = tk.Frame(self.container, bg=BG)
@@ -447,6 +530,8 @@ class AppBuilderWindow:
 
     def show_page(self, name):
         self.current_page = name
+        if name == "run" and self._oven_job is None:
+            self._oven_tick()
         self.pages[name].tkraise()
         self.step_label.configure(text=self._STEP_TEXT.get(name, ""))
         if name == "welcome" and hasattr(self, "runs_list_frame"):
@@ -742,14 +827,84 @@ class AppBuilderWindow:
         self.progress_bar = ttk.Progressbar(page, mode="determinate", maximum=100, value=0,
                                             style="Big.Horizontal.TProgressbar")
         self.progress_bar.pack(fill="x", padx=26, pady=(2, 10))
-        toggle = tk.Checkbutton(page, text="作業ログを見る", variable=self.show_log_var,
+        self.oven_canvas = tk.Canvas(page, height=108, bg=BG, highlightthickness=0)
+        self.oven_canvas.pack(fill="x", padx=26, pady=(0, 2))
+        toggle_row = tk.Frame(page, bg=BG)
+        toggle_row.pack(fill="x", padx=26)
+        toggle = tk.Checkbutton(toggle_row, text="作業ログを見る", variable=self.show_log_var,
                                 command=self._toggle_log, font=self.F(12), bg=BG, fg=MUTED,
                                 activebackground=BG, anchor="w")
-        toggle.pack(fill="x", padx=26)
+        toggle.pack(side="left")
+        tk.Checkbutton(toggle_row, text="🔔 焼き上がったら音で知らせる（チーン♪）",
+                       variable=self.sound_var, font=self.F(12), bg=BG, fg=MUTED,
+                       activebackground=BG, anchor="w").pack(side="left", padx=(18, 0))
+        tk.Label(toggle_row, text="オーブンの中で焼いています",
+                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(side="left", padx=(14, 0))
         self.log_text = scrolledtext.ScrolledText(page, height=6, wrap="word",
                                                   font=self.F(11), state="disabled",
                                                   padx=10, pady=8)
         self.log_text.pack(fill="x", padx=26, pady=(4, 0))
+        # 作成中画面はスクロール対応になったため、「中止する」を上部へ移す
+        # （スクロールしなくてもすぐ押せるように。通常画面のナビは下部固定）
+        nav.pack_forget()
+        nav.pack(side="top", fill="x", padx=26, pady=(0, 2), before=self.run_status)
+
+    # ---- oven animation (演出) ----
+    def _oven_tick(self):
+        if self.current_page != "run":
+            self._oven_job = None
+            return
+        self.oven_frame += 1
+        try:
+            ratio = float(self.progress_bar.cget("value")) / 100.0
+        except (tk.TclError, ValueError):
+            ratio = 0.0
+        self._draw_oven(ratio)
+        self._oven_job = self.root.after(150, self._oven_tick)
+
+    def _draw_oven(self, ratio):
+        canvas = getattr(self, "oven_canvas", None)
+        if canvas is None:
+            return
+        width = max(canvas.winfo_width(), 600)
+        cx = width // 2
+        canvas.delete("all")
+        # oven body
+        canvas.create_rectangle(cx - 185, 4, cx + 185, 104, fill="#39404d",
+                                outline="#23272f", width=2)
+        canvas.create_rectangle(cx - 165, 11, cx + 165, 29, fill="#2b3038", outline="")
+        canvas.create_text(cx, 20, text="AI OVEN", fill="#cfd6df",
+                           font=self.F(10, True))
+        # door window; glass warms up as baking progresses
+        glass = _mix_color("#5d6a7a", "#7a4a1d", ratio)
+        canvas.create_rectangle(cx - 152, 34, cx + 152, 98, fill=glass,
+                                outline="#20242b", width=2)
+        # heater glow (flickers with the frame counter)
+        glow = "#ff9a3c" if self.oven_frame % 2 == 0 else "#e87f24"
+        if ratio > 0.03:
+            canvas.create_line(cx - 142, 93, cx + 142, 93, fill=glow, width=3)
+            canvas.create_line(cx - 142, 40, cx + 142, 40, fill=glow, width=2)
+        # the app being baked: rises and browns with progress
+        rise = ratio * 8
+        item_fill = _mix_color("#f7ecc4", "#cf8433", ratio)
+        canvas.create_rectangle(cx - 142, 88, cx + 142, 91, fill="#8f9aa8", outline="")
+        canvas.create_oval(cx - 52, 62 - rise, cx + 52, 89 - rise,
+                           fill=item_fill, outline="#a9713a", width=2)
+        canvas.create_text(cx, 75 - rise, text="アプリ", fill="#5b3a12",
+                           font=self.F(11, True))
+        # steam once it is fairly baked
+        if ratio > 0.35:
+            for i in range(3):
+                sx = cx - 44 + i * 44
+                sy = 54 - ((self.oven_frame * 2 + i * 9) % 14)
+                canvas.create_oval(sx - 5, sy - 7, sx + 5, sy + 7,
+                                   fill="#e8edf2", outline="")
+        # honest bake gauge inside the door window (top-right)
+        canvas.create_text(cx + 144, 48, text=f"焼き加減 {int(ratio * 100)}%",
+                           fill="#ffe9b0", font=self.F(10, True), anchor="e")
+        if ratio >= 0.999:
+            canvas.create_text(cx, 20, text="AI OVEN ― 焼き上がり！",
+                               fill="#ffd98a", font=self.F(10, True))
 
     def _toggle_log(self):
         if self.show_log_var.get():
@@ -1320,6 +1475,20 @@ class AppBuilderWindow:
             if note:
                 tk.Label(body, text=note, font=self.F(11), fg=MUTED, bg=CARD,
                          anchor="w").pack(fill="x")
+        tk.Label(body, text="完成のお知らせ音", font=self.F(13, True), fg=INK, bg=CARD,
+                 anchor="w").pack(fill="x", pady=(16, 2))
+        sound_settings_row = tk.Frame(body, bg=CARD)
+        sound_settings_row.pack(fill="x")
+        tk.Checkbutton(sound_settings_row, text="焼き上がったら「チーン♪」と鳴らす",
+                       variable=self.sound_var, font=self.F(13), bg=CARD, fg=INK,
+                       activebackground=CARD, anchor="w").pack(side="left")
+        tk.Button(sound_settings_row, text="試しに鳴らす",
+                  command=lambda: play_chime("success"),
+                  font=self.F(12), bg=BG, fg=PRIMARY_DARK, relief="flat",
+                  padx=12, pady=5, cursor="hand2",
+                  highlightbackground=LINE, highlightthickness=1).pack(side="left", padx=(12, 0))
+        tk.Label(body, text="途中で止まったときは、完成と区別できるよう別の音が鳴ります。作成中の画面からも切り替えられます。",
+                 font=self.F(11), fg=MUTED, bg=CARD, anchor="w").pack(fill="x")
 
     # ---- connection check ----
     def check_connection(self):
@@ -1622,6 +1791,12 @@ class AppBuilderWindow:
                     code, output = data
                     self.last_output = Path(output)
                     self.busy = False
+                    if self.sound_var.get():
+                        if code in (0, 2):
+                            play_chime("success")
+                        elif not (self.cancel_event is not None
+                                  and self.cancel_event.is_set()):
+                            play_chime("failed")
                     self.output_ready = code in (0, 2) and (self.last_output / "index.html").is_file()
                     for key, _e, _n, _r in DEPARTMENTS:
                         if code in (0, 2):
@@ -1659,6 +1834,8 @@ class AppBuilderWindow:
                     messagebox.showerror("GitHub公開を完了できませんでした", advice, parent=self.root)
                     self.update_publish_button()
                 elif kind == "worker_error":
+                    if self.sound_var.get():
+                        play_chime("failed")
                     self.busy = False
                     messagebox.showerror("実行できませんでした", error_guidance("事前確認・実行", data), parent=self.root)
                     self._show_done(1, self.last_output or Path("."))
