@@ -281,7 +281,7 @@ class AppBuilderWindow:
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.3")
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.4")
         root.geometry("1060x830")
         root.minsize(920, 700)
         root.configure(bg=BG)
@@ -304,6 +304,7 @@ class AppBuilderWindow:
         self.container.grid_rowconfigure(0, weight=1)
         self.container.grid_columnconfigure(0, weight=1)
         self.pages = {}
+        self._scroll_canvases = {}
         for name, builder in (
             ("welcome", self._page_welcome),
             ("idea", self._page_idea),
@@ -314,14 +315,52 @@ class AppBuilderWindow:
             ("publish", self._page_publish),
             ("settings", self._page_settings),
         ):
-            frame = tk.Frame(self.container, bg=BG)
+            if name in ("welcome", "models"):
+                # v3.4: 内容がウィンドウの高さを超える画面はスクロール可能にする。
+                # 固定 1060x830 のままでは、作品が増えた最初の画面や
+                # 文字を大きくした2番目の画面で一番下が見えなくなるため。
+                frame = self._scrollable_page(name, builder)
+            else:
+                frame = tk.Frame(self.container, bg=BG)
+                builder(frame)
             frame.grid(row=0, column=0, sticky="nsew")
             self.pages[name] = frame
-            builder(frame)
+        root.bind_all("<MouseWheel>", self._on_mousewheel)
+        root.bind_all("<Button-4>", self._on_mousewheel)
+        root.bind_all("<Button-5>", self._on_mousewheel)
         self.show_page("welcome")
         self.root.after(150, self.process_events)
         self.root.after(1000, self._tick_clock)
         self.root.after(400, self.check_connection)
+
+    def _scrollable_page(self, name, builder):
+        """縦スクロール付きの画面を作り、中のフレームに builder を実行する。"""
+        outer = tk.Frame(self.container, bg=BG)
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=BG)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda _e, c=canvas: c.configure(scrollregion=c.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e, c=canvas, w=window: c.itemconfig(w, width=e.width))
+        builder(inner)
+        self._scroll_canvases[name] = canvas
+        return outer
+
+    def _on_mousewheel(self, event):
+        canvas = self._scroll_canvases.get(self.current_page)
+        if canvas is None:
+            return
+        if event.num == 4:
+            canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            canvas.yview_scroll(1, "units")
+        elif getattr(event, "delta", 0):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
 
     # ---- fonts (resizable) ----
     def F(self, size, bold=False):
@@ -378,7 +417,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.3 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.4 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)

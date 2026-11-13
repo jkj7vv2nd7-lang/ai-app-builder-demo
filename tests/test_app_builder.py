@@ -664,5 +664,51 @@ class RenderCheckTests(unittest.TestCase):
 
 
 
+class ValidationRobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model="test-model",
+            planning_model=None, design_model=None,
+            implementation_model=None, qa_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3, num_predict=256, num_ctx=2048, timeout=10,
+            max_qa_revisions=0, max_impl_repairs=2, browser_check=False,
+        )
+        self.html = (
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><main>Working app</main>"
+            "<script>var ok = 1;</script></body></html>"
+        )
+
+    def test_node_timeout_is_not_a_validation_error(self):
+        import subprocess as sp
+        with patch.object(app_builder.subprocess, "run",
+                          side_effect=sp.TimeoutExpired(cmd="node", timeout=60)):
+            checks = app_builder.validate_html(self.html)
+        self.assertTrue(checks["passed"])
+        self.assertEqual(checks["javascript"]["status"], "unavailable")
+
+    def test_identical_problems_abort_repairs_early(self):
+        broken = (
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><main>Broken</main>"
+            "<script>var x = ;</script></body></html>"
+        )
+        lines = []
+        responses = ["Requirements", "Design", broken, broken, broken, broken]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses) as call_mock:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = app_builder.run_pipeline(
+                        "壊れるアプリ", self.args, run_dir,
+                        progress_callback=lines.append)
+        self.assertEqual(code, 1)
+        # PM + design + implementation attempt 0 + one repair, then abort.
+        self.assertEqual(call_mock.call_count, 4)
+        self.assertTrue(any("打ち切ります" in line for line in lines))
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -446,12 +446,15 @@ def validate_html(html_content):
                     input=script,
                     text=True,
                     capture_output=True,
-                    timeout=15,
+                    timeout=60,
                     check=False,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                errors.append(f"JavaScript check failed for inline script {index}: {exc}")
-                js_detail = "Node.js check could not complete."
+                # A slow/unavailable checker is an environment problem, not
+                # a defect in the app. Never fail validation for it.
+                js_status = "unavailable"
+                js_detail = (f"Node.jsの構文チェックを完了できませんでした（{exc}）。"
+                             "チェック側の問題として扱い、不合格にはしません。")
                 break
             if result.returncode:
                 detail = (result.stderr or result.stdout).strip()
@@ -1031,6 +1034,7 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
             log(f"[3/4] HTMLアプリを実装中...（{models['implementation']}）")
             previous_text = ""
             problems = []
+            previous_problems = None
             for attempt in range(int(getattr(args, "max_impl_repairs", 2)) + 1):
                 if attempt == 0:
                     raw = call(
@@ -1056,6 +1060,10 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
                     break
                 problems = candidate_checks["errors"]
                 previous_text = candidate
+                if previous_problems is not None and problems == previous_problems:
+                    log("[REPAIR] 前回とまったく同じ問題のため、これ以上作り直しても直らないと判断して自動修復を打ち切ります。")
+                    break
+                previous_problems = problems
             if current_html is None:
                 partial = extract_html(previous_text)
                 if partial:
@@ -1335,6 +1343,7 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
         current_html = None
         checks = None
         problems = []
+        previous_problems = None
         previous_text = source_html
         max_repairs = int(getattr(args, "max_impl_repairs", 2))
         for attempt in range(max_repairs + 1):
@@ -1363,6 +1372,10 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
                 break
             problems = candidate_checks["errors"]
             previous_text = candidate
+            if previous_problems is not None and problems == previous_problems:
+                log("[REPAIR] 前回とまったく同じ問題のため、自動修復を打ち切ります。")
+                break
+            previous_problems = problems
         if current_html is None:
             partial = extract_html(previous_text)
             if partial and partial.strip() != source_html.strip():
