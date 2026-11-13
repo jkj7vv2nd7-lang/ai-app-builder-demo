@@ -211,261 +211,444 @@ def publication_guidance(error):
     return details
 
 
+import tkinter.font as tkfont
+
+
+# ---------------------------------------------------------------------------
+# v3 GUI: a step-by-step wizard.
+#
+# Design rules (from the user's own feedback on v2):
+#   * one job per screen, screens change as the work advances;
+#   * large type everywhere (presbyopia-friendly), with a size switcher;
+#   * the opening screen should promise something: the four AI departments
+#     are shown as a "company" with their assigned models on cards;
+#   * settings and GitHub publishing live on their own screens, never on
+#     the main flow.
+# ---------------------------------------------------------------------------
+
+NAVY = "#1F2A5C"
+NAVY2 = "#2B3A8F"
+PRIMARY = "#3156C9"
+PRIMARY_DARK = "#233F9B"
+AMBER = "#F5A623"
+BG = "#EEF1F8"
+CARD = "#FFFFFF"
+INK = "#172033"
+MUTED = "#5A6579"
+GREEN = "#1E8E4D"
+RED = "#C0392B"
+LINE = "#D8DEEC"
+SOFT = "#EDF1FF"
+
+DEPARTMENTS = (
+    ("requirements", "🧭", "PM・要件定義", "アイデアを、作れる要件に整理します"),
+    ("design", "🎨", "デザイン設計", "画面と操作の設計図を描きます"),
+    ("implementation", "💻", "実装", "実際に動くアプリを書きます"),
+    ("qa", "🔍", "QA・検査", "動くかどうかを検査し、直します"),
+)
+EXAMPLE_IDEAS = (
+    ("英単語クイズ", "中学生向け英単語クイズ。出題・回答判定・正解数の表示・進捗保存をしたい"),
+    ("家計簿メモ", "月末になると何にお金を使ったか分からなくなる。ざっくり記録して合計が見たい"),
+    ("水やり記録", "植物にいつ水をあげたか忘れやすい。植物ごとに記録して、前回日が見たい"),
+)
+
+
 class AppBuilderWindow:
     def __init__(self, root):
         self.root = root
         self.events = queue.Queue()
         self.busy = False
+        self.checking = False
         self.last_output = None
         self.output_ready = False
         self.installed_models = None
         self.installed_details = None
         self.cancel_event = None
         self.active_models = {}
-        self.input_controls = []
+        self.current_page = "welcome"
+        self._fonts = []
+        self._scale_idx = 0
+        self._scales = (1.0, 1.18, 1.36)
+        self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発エージェント v2")
-        root.geometry("840x900")
-        root.minsize(720, 740)
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3")
+        root.geometry("1060x800")
+        root.minsize(920, 680)
+        root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        outer = ttk.Frame(root, padding=16)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="AIアプリ開発エージェント v2", font=("", 18, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="アイデアを入力して開始します。部署（PM・設計・実装・QA）ごとに最適なモデルへ自動で切り替わり、生成は途中で止まらず進み具合が見えます。失敗しても自動で直し、途中成果はいつも保存されます。",
-            wraplength=770,
-        ).pack(anchor="w", pady=(4, 12))
-
-        request_frame = ttk.LabelFrame(outer, text="1. 作りたいアプリ（必須）", padding=10)
-        request_frame.pack(fill="x")
-        self.request_text = scrolledtext.ScrolledText(request_frame, height=5, wrap="word")
-        self.request_text.pack(fill="x")
-        self.input_controls.append(self.request_text)
-        ttk.Label(
-            request_frame,
-            text=f"入力例: {EXAMPLE_REQUEST}\n誰向けか・何をしたいかを書いてください。空欄では実行できません。",
-            wraplength=750,
-        ).pack(anchor="w", pady=(5, 0))
-
-        settings = ttk.LabelFrame(outer, text="2. Ollama・モデル設定", padding=10)
-        settings.pack(fill="x", pady=(10, 0))
-        ttk.Label(settings, text="接続先").grid(row=0, column=0, sticky="w")
+        # ---- shared variables ----
         self.endpoint_var = tk.StringVar(value=app_builder.DEFAULT_ENDPOINT)
-        endpoint_entry = ttk.Entry(settings, textvariable=self.endpoint_var, width=48)
-        endpoint_entry.grid(
-            row=0, column=1, sticky="ew", padx=(8, 8)
-        )
-        self.input_controls.append(endpoint_entry)
-        self.check_button = ttk.Button(settings, text="接続・モデルを確認", command=self.check_connection)
-        self.check_button.grid(row=0, column=2, sticky="e")
-        self.model_status = ttk.Label(settings, text="起動確認中...")
-        self.model_status.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 8))
-
-        ttk.Label(settings, text="単一モードのモデル").grid(row=2, column=0, sticky="w")
         self.model_var = tk.StringVar(value=app_builder.DEFAULT_MODEL)
-        self.model_entry = ttk.Entry(settings, textvariable=self.model_var, width=36)
-        self.model_entry.grid(
-            row=2, column=1, sticky="w", padx=(8, 0)
-        )
-        self.input_controls.append(self.model_entry)
-        self.separate_var = tk.BooleanVar(value=False)
-        ttk.Label(
-            settings,
-            text="部署ごとのモデル（「部署ごとに手動」を選んだときだけ有効。一覧から選べます）",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 4))
-
-        self.stage_model_vars = {
-            "requirements": tk.StringVar(),
-            "design": tk.StringVar(),
-            "implementation": tk.StringVar(),
-            "qa": tk.StringVar(),
-        }
-        self.stage_model_entries = {}
-        for row, (key, label) in enumerate(
-            (("requirements", "PM・要件定義"), ("design", "デザイン設計"), ("implementation", "実装"), ("qa", "QA")),
-            start=4,
-        ):
-            ttk.Label(settings, text=f"  {label}").grid(row=row, column=0, sticky="w")
-            entry = ttk.Combobox(settings, textvariable=self.stage_model_vars[key], width=34, state="disabled")
-            entry.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
-            self.stage_model_entries[key] = entry
-            self.input_controls.append(entry)
-            ttk.Label(settings, text="空欄なら単一モデルを使用").grid(row=row, column=2, sticky="w")
-
-        ttk.Label(settings, text="コンテキスト").grid(row=8, column=0, sticky="w", pady=(8, 0))
         self.context_var = tk.StringVar(value="4096")
-        context_combo = ttk.Combobox(
-            settings,
-            textvariable=self.context_var,
-            values=("2048", "4096", "8192"),
-            width=12,
-            state="readonly",
-        )
-        context_combo.grid(row=8, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        self.input_controls.append(context_combo)
-        ttk.Label(settings, text="タイムアウト（秒）").grid(row=9, column=0, sticky="w", pady=(6, 0))
         self.timeout_var = tk.StringVar(value="600")
-        timeout_entry = ttk.Entry(settings, textvariable=self.timeout_var, width=12)
-        timeout_entry.grid(row=9, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
-        self.input_controls.append(timeout_entry)
-        settings.columnconfigure(1, weight=1)
-
-        routing = ttk.LabelFrame(outer, text="3. モデルの使い方", padding=8)
-        routing.pack(fill="x", pady=(8, 0))
         self.routing_var = tk.StringVar(value="smart")
-        smart_radio = ttk.Radiobutton(
-            routing,
-            text="自動で部署ごとに切替（おすすめ）",
-            value="smart",
-            variable=self.routing_var,
-            command=self.on_routing_changed,
-        )
-        smart_radio.pack(side="left")
-        single_radio = ttk.Radiobutton(
-            routing,
-            text="単一モデル",
-            value="single",
-            variable=self.routing_var,
-            command=self.on_routing_changed,
-        )
-        single_radio.pack(side="left", padx=(12, 0))
-        manual_radio = ttk.Radiobutton(
-            routing,
-            text="部署ごとに手動で選ぶ",
-            value="manual",
-            variable=self.routing_var,
-            command=self.on_routing_changed,
-        )
-        manual_radio.pack(side="left", padx=(12, 0))
-        self.input_controls.extend((smart_radio, single_radio, manual_radio))
-        self.routing_summary = tk.StringVar()
-        ttk.Label(routing, textvariable=self.routing_summary, wraplength=770).pack(
-            anchor="w", pady=(6, 0)
-        )
-
-        ttk.Label(
-            outer,
-            text="自動モードでは、導入済みのモデルの中から部署ごとに得意なものを選びます（PM・設計は日本語と推論が得意な汎用モデル、実装・QAはコード特化モデルを優先）。"
-            "理想のモデルが無くても、今あるモデルの中で最適な割り当てで続行します。"
-            "モデルは各工程の後にアンロードされるため、切替時に少しロード待ちがあります（16GBメモリを守るためです）。",
-            wraplength=780,
-        ).pack(anchor="w", pady=(8, 8))
-
-        action_row = ttk.Frame(outer)
-        action_row.pack(fill="x")
-        self.start_button = ttk.Button(action_row, text="アプリを作成", command=self.start_generation)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(action_row, text="中止", command=self.stop_generation, state="disabled")
-        self.stop_button.pack(side="left", padx=(8, 0))
-        self.preview_button = ttk.Button(action_row, text="生成アプリを開く", command=self.preview_output, state="disabled")
-        self.preview_button.pack(side="left", padx=(8, 0))
-        self.resume_button = ttk.Button(action_row, text="つづきから再開", command=self.resume_generation)
-        self.resume_button.pack(side="left", padx=(8, 0))
-        self.open_button = ttk.Button(action_row, text="出力フォルダーを開く", command=self.open_output, state="disabled")
-        self.open_button.pack(side="left", padx=(8, 0))
-        self.progress_bar = ttk.Progressbar(outer, mode="determinate", maximum=4, value=0)
-        self.progress_bar.pack(fill="x", pady=(8, 0))
-        self.status_var = tk.StringVar(value="準備中")
-        ttk.Label(action_row, textvariable=self.status_var).pack(side="left", padx=(12, 0))
-
-        publish_frame = ttk.LabelFrame(outer, text="GitHub Pages（公開リポジトリへHTMLをアップロード）", padding=8)
-        publish_frame.pack(fill="x", pady=(8, 0))
-        ttk.Label(publish_frame, text="作成済みリポジトリURL").grid(row=0, column=0, sticky="w")
+        self.stage_model_vars = {key: tk.StringVar() for key in STAGE_KEYS}
         self.repository_url_var = tk.StringVar()
-        self.repository_url_entry = ttk.Entry(
-            publish_frame,
-            textvariable=self.repository_url_var,
-            width=54,
-        )
-        self.repository_url_entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
-        self.input_controls.append(self.repository_url_entry)
-        ttk.Label(
-            publish_frame,
-            text="例: https://github.com/owner/my-app",
-        ).grid(row=0, column=2, sticky="w")
         self.publication_reviewed_var = tk.BooleanVar(value=False)
-        self.publication_review_check = ttk.Checkbutton(
-            publish_frame,
-            text="HTMLを確認し、公開リポジトリで誰でも見られることを理解しました。",
-            variable=self.publication_reviewed_var,
-            command=self.update_publish_button,
-        )
-        self.publication_review_check.grid(row=1, column=0, columnspan=3, sticky="w", pady=(5, 0))
-        self.input_controls.append(self.publication_review_check)
-        self.publish_button = ttk.Button(
-            publish_frame,
-            text="GitHubへアップロード",
-            command=self.start_publication,
-            state="disabled",
-        )
-        self.publish_button.grid(row=2, column=0, sticky="w", pady=(5, 0))
-        self.publication_status_var = tk.StringVar(
-            value="このアプリはリポジトリを作成せず、Pagesも有効化しません。"
-        )
-        ttk.Label(
-            publish_frame,
-            textvariable=self.publication_status_var,
-            wraplength=700,
-        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(5, 0))
-        publish_frame.columnconfigure(1, weight=1)
-        self.repository_url_var.trace_add("write", lambda *_: self.update_publish_button())
+        self.show_log_var = tk.BooleanVar(value=True)
 
-        progress_frame = ttk.LabelFrame(outer, text="進捗", padding=10)
-        progress_frame.pack(fill="x", pady=(10, 0))
-        self.phase_vars = {}
-        for phase in PHASES:
-            variable = tk.StringVar(value=f"○ {phase}")
-            self.phase_vars[phase] = variable
-            ttk.Label(progress_frame, textvariable=variable).pack(anchor="w")
-
-        self.log_text = scrolledtext.ScrolledText(outer, height=9, wrap="word", state="disabled")
-        self.log_text.pack(fill="both", expand=True, pady=(10, 0))
-        self.model_var.trace_add("write", lambda *_: self.refresh_routing_summary())
-        self.separate_var.trace_add("write", lambda *_: self.refresh_routing_summary())
-        for variable in self.stage_model_vars.values():
-            variable.trace_add("write", lambda *_: self.refresh_routing_summary())
-        self.refresh_routing_summary()
-        self.on_routing_changed()
+        self._build_header(root)
+        self.container = tk.Frame(root, bg=BG)
+        self.container.pack(fill="both", expand=True)
+        self.container.grid_rowconfigure(0, weight=1)
+        self.container.grid_columnconfigure(0, weight=1)
+        self.pages = {}
+        for name, builder in (
+            ("welcome", self._page_welcome),
+            ("idea", self._page_idea),
+            ("models", self._page_models),
+            ("run", self._page_run),
+            ("done", self._page_done),
+            ("publish", self._page_publish),
+            ("settings", self._page_settings),
+        ):
+            frame = tk.Frame(self.container, bg=BG)
+            frame.grid(row=0, column=0, sticky="nsew")
+            self.pages[name] = frame
+            builder(frame)
+        self.show_page("welcome")
         self.root.after(150, self.process_events)
-        self.root.after(250, self.check_connection)
+        self.root.after(400, self.check_connection)
 
-    def toggle_stage_models(self):
-        state = "normal" if self.routing_var.get() == "manual" and not self.busy else "disabled"
-        for entry in self.stage_model_entries.values():
-            entry.configure(state=state)
+    # ---- fonts (resizable) ----
+    def F(self, size, bold=False):
+        font = tkfont.Font(family="Yu Gothic UI", size=size,
+                           weight="bold" if bold else "normal")
+        self._fonts.append((font, size))
+        return font
 
-    def on_routing_changed(self):
-        is_auto = self.routing_var.get() in {"smart", "auto"}
-        self.model_entry.configure(state="disabled" if is_auto or self.busy else "normal")
-        for entry in self.stage_model_entries.values():
-            enabled = self.routing_var.get() == "manual" and not self.busy
-            entry.configure(state="normal" if enabled else "disabled")
-        self.refresh_routing_summary()
+    def cycle_text_size(self):
+        self._scale_idx = (self._scale_idx + 1) % len(self._scales)
+        scale = self._scales[self._scale_idx]
+        for font, base in self._fonts:
+            font.configure(size=max(8, int(base * scale)))
+        self.size_button.configure(text=f"文字の大きさ: {self._scale_names[self._scale_idx]}")
 
-    def refresh_routing_summary(self):
-        stage_models = {key: value.get() for key, value in self.stage_model_vars.items()}
+    # ---- shared widget helpers ----
+    def _card(self, parent, **kw):
+        return tk.Frame(parent, bg=CARD, highlightbackground=LINE,
+                        highlightthickness=1, padx=18, pady=14, **kw)
+
+    def _big_button(self, parent, text, command, primary=False, danger=False, width=None):
+        bg = PRIMARY if primary else (RED if danger else CARD)
+        fg = "#FFFFFF" if (primary or danger) else PRIMARY_DARK
+        active = PRIMARY_DARK if primary else ("#96281B" if danger else SOFT)
+        btn = tk.Button(parent, text=text, command=command, font=self.F(15, True),
+                        bg=bg, fg=fg, activebackground=active,
+                        activeforeground=fg if not (primary or danger) else "#FFFFFF",
+                        relief="flat", padx=22, pady=12, cursor="hand2",
+                        highlightbackground=LINE, highlightthickness=0 if (primary or danger) else 1)
+        if width:
+            btn.configure(width=width)
+        return btn
+
+    def _nav_row(self, parent):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(side="bottom", fill="x", padx=26, pady=12)
+        return row
+
+    def _page_title(self, parent, text, sub=None):
+        tk.Label(parent, text=text, font=self.F(22, True), fg=NAVY, bg=BG,
+                 anchor="w").pack(fill="x", padx=26, pady=(16, 2))
+        if sub:
+            tk.Label(parent, text=sub, font=self.F(13), fg=MUTED, bg=BG,
+                     anchor="w", wraplength=940).pack(fill="x", padx=26, pady=(0, 8))
+
+    # ---- header ----
+    def _build_header(self, root):
+        header = tk.Frame(root, bg=NAVY)
+        header.pack(fill="x")
+        left = tk.Frame(header, bg=NAVY)
+        left.pack(side="left", padx=20, pady=10)
+        tk.Label(left, text="🏢", font=self.F(30), bg=NAVY, fg="#FFFFFF").pack(side="left")
+        titles = tk.Frame(left, bg=NAVY)
+        titles.pack(side="left", padx=(10, 0))
+        tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
+                 bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+                 font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
+        right = tk.Frame(header, bg=NAVY)
+        right.pack(side="right", padx=20, pady=10)
+        self.step_label = tk.Label(right, text="", font=self.F(13, True),
+                                   bg=NAVY, fg=AMBER, anchor="e")
+        self.step_label.pack(fill="x")
+        self.size_button = tk.Button(right, text="文字の大きさ: 標準", command=self.cycle_text_size,
+                                     font=self.F(11), bg=NAVY2, fg="#FFFFFF", relief="flat",
+                                     padx=12, pady=5, cursor="hand2", activebackground=PRIMARY,
+                                     activeforeground="#FFFFFF")
+        self.size_button.pack(anchor="e", pady=(6, 0))
+
+    _STEP_TEXT = {
+        "welcome": "準備の画面",
+        "idea": "ステップ 1 / 4",
+        "models": "ステップ 2 / 4",
+        "run": "ステップ 3 / 4",
+        "done": "ステップ 4 / 4",
+        "publish": "GitHub公開",
+        "settings": "設定",
+    }
+
+    def show_page(self, name):
+        self.current_page = name
+        self.pages[name].tkraise()
+        self.step_label.configure(text=self._STEP_TEXT.get(name, ""))
+
+    # ---- page: welcome ----
+    def _page_welcome(self, page):
+        hero = self._card(page)
+        hero.pack(fill="x", padx=26, pady=(24, 14))
+        tk.Label(hero, text="一言のアイデアから、動くアプリを作ります。",
+                 font=self.F(25, True), fg=NAVY, bg=CARD, anchor="w").pack(fill="x")
+        tk.Label(hero,
+                 text="4人のAI社員が「要件 → 設計 → 実装 → 検査」の順に仕事を進めます。"
+                      "部署ごとに、その仕事が一番得意なモデルへ自動で切り替わります。"
+                      "生成はすべてあなたのPCの中だけで行われます。",
+                 font=self.F(13), fg=MUTED, bg=CARD, anchor="w",
+                 wraplength=920, justify="left").pack(fill="x", pady=(6, 0))
+
+        cards = tk.Frame(page, bg=BG)
+        cards.pack(fill="x", padx=26, pady=(2, 14))
+        self.dept_card_models = {}
+        for idx, (key, emoji, dept_name, role) in enumerate(DEPARTMENTS):
+            card = self._card(cards)
+            card.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 6, 0))
+            cards.grid_columnconfigure(idx, weight=1)
+            tk.Label(card, text=emoji, font=self.F(30), bg=CARD).pack()
+            tk.Label(card, text=dept_name, font=self.F(15, True), fg=INK, bg=CARD).pack()
+            tk.Label(card, text=role, font=self.F(11), fg=MUTED, bg=CARD,
+                     wraplength=190, justify="center").pack(pady=(2, 4))
+            model_label = tk.Label(card, text="モデル確認中…", font=self.F(12, True),
+                                   fg=PRIMARY_DARK, bg=SOFT, wraplength=190, justify="center")
+            model_label.pack(fill="x", ipady=4)
+            self.dept_card_models[key] = model_label
+
+        conn = self._card(page)
+        conn.pack(fill="x", padx=26, pady=(0, 16))
+        self.conn_label = tk.Label(conn, text="● Ollamaを確認しています…",
+                                   font=self.F(14, True), fg=MUTED, bg=CARD, anchor="w")
+        self.conn_label.pack(side="left")
+        self.conn_detail = tk.Label(conn, text="", font=self.F(11), fg=MUTED, bg=CARD, anchor="w")
+        self.conn_detail.pack(side="left", padx=(12, 0))
+        tk.Button(conn, text="再確認", command=self.check_connection, font=self.F(12),
+                  bg=CARD, fg=PRIMARY_DARK, relief="flat", padx=14, pady=6,
+                  cursor="hand2", highlightbackground=LINE, highlightthickness=1).pack(side="right")
+
+        actions = tk.Frame(page, bg=BG)
+        actions.pack(fill="x", padx=26)
+        self.start_flow_button = self._big_button(
+            actions, "▶ アプリを作りはじめる", lambda: self.show_page("idea"), primary=True)
+        self.start_flow_button.pack(side="left")
+        self._big_button(actions, "つづきから再開", self.resume_generation).pack(side="left", padx=(12, 0))
+        self._big_button(actions, "⚙ 設定", lambda: self.show_page("settings")).pack(side="right")
+        tk.Label(page,
+                 text="「つづきから再開」は、前回途中で止まった作業を保存済みの工程から続けるときに使います。",
+                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=26, pady=(10, 0))
+
+    # ---- page: idea ----
+    def _page_idea(self, page):
+        nav = self._nav_row(page)
+        self._big_button(nav, "← もどる", lambda: self.show_page("welcome")).pack(side="left")
+        self._big_button(nav, "つぎへ：担当モデルを確認する →", self.goto_models, primary=True).pack(side="right")
+        self._page_title(page, "① 作りたいアプリを教えてください",
+                         "むずかしく書かなくて大丈夫です。「誰が・何に困っていて・どうなると嬉しいか」が伝われば、PMが要件に整理します。")
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="both", expand=True, padx=26)
+        self.request_text = scrolledtext.ScrolledText(
+            body, height=8, wrap="word", font=self.F(15), padx=14, pady=12,
+            highlightbackground=LINE, highlightthickness=1, relief="flat")
+        self.request_text.pack(fill="both", expand=True)
+        chips = tk.Frame(body, bg=BG)
+        chips.pack(fill="x", pady=(12, 0))
+        tk.Label(chips, text="例文を入れる:", font=self.F(12), fg=MUTED, bg=BG).pack(side="left")
+        for label, example in EXAMPLE_IDEAS:
+            tk.Button(chips, text=label,
+                      command=lambda ex=example: self._set_idea(ex),
+                      font=self.F(12), bg=CARD, fg=PRIMARY_DARK, relief="flat",
+                      padx=14, pady=7, cursor="hand2",
+                      highlightbackground=LINE, highlightthickness=1).pack(side="left", padx=(8, 0))
+
+    def _set_idea(self, text):
+        self.request_text.delete("1.0", "end")
+        self.request_text.insert("1.0", text)
+        self.request_text.focus_set()
+
+    # ---- page: models ----
+    def _page_models(self, page):
+        nav = self._nav_row(page)
+        self._big_button(nav, "← もどる", lambda: self.show_page("idea")).pack(side="left")
+        self.create_button = self._big_button(nav, "▶ この内容で作成をはじめる", self.start_generation, primary=True)
+        self.create_button.pack(side="right")
+        self._page_title(page, "② どのモデルで進めますか",
+                         "おすすめは「自動」です。部署ごとに一番得意なモデルを選びます。")
+        modes = tk.Frame(page, bg=BG)
+        modes.pack(fill="x", padx=26)
+        mode_defs = (
+            ("smart", "🤖 自動で部署ごとに切替（おすすめ）", "PM・設計は汎用モデル、実装・QAはコード特化モデルを自動で割り当てます"),
+            ("single", "🧑‍🤝‍🧑 全員同じモデル（単一モデル）", "4部署とも同じモデルで進めます"),
+            ("manual", "🎛 部署ごとに自分で選ぶ（手動）", "下の表で、部署ごとに使うモデルを指定します"),
+        )
+        self.mode_buttons = {}
+        for value, title, desc in mode_defs:
+            btn = tk.Radiobutton(
+                modes, text=f"{title}\n{desc}", value=value, variable=self.routing_var,
+                command=self.on_mode_changed, font=self.F(13), bg=CARD, fg=INK,
+                selectcolor=SOFT, indicatoron=False, justify="left", anchor="w",
+                wraplength=930, padx=16, pady=7, cursor="hand2",
+                highlightbackground=LINE, highlightthickness=1,
+                activebackground=SOFT)
+            btn.pack(fill="x", pady=(0, 6))
+            self.mode_buttons[value] = btn
+
+        table = self._card(page)
+        table.pack(fill="x", padx=26, pady=(4, 0))
+        tk.Label(table, text="部署ごとの担当", font=self.F(14, True), fg=NAVY, bg=CARD,
+                 anchor="w").pack(fill="x", pady=(0, 0))
+        self.assign_rows = {}
+        for key, emoji, dept_name, _role in DEPARTMENTS:
+            row = tk.Frame(table, bg=CARD)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{emoji} {dept_name}", font=self.F(14, True), fg=INK,
+                     bg=CARD, width=16, anchor="w").pack(side="left")
+            model_label = tk.Label(row, text="―", font=self.F(14, True), fg=PRIMARY_DARK,
+                                   bg=CARD, anchor="w")
+            model_label.pack(side="left")
+            combo = ttk.Combobox(row, textvariable=self.stage_model_vars[key],
+                                 font=self.F(13), width=30)
+            reason_label = tk.Label(table, text="", font=self.F(10), fg=MUTED, bg=CARD, anchor="w")
+            reason_label.pack(fill="x", padx=(190, 0))
+            self.assign_rows[key] = (model_label, combo, reason_label)
+        self.models_note = tk.Label(page, text="", font=self.F(11), fg=MUTED, bg=BG,
+                                    anchor="w", wraplength=940)
+        self.models_note.pack(fill="x", padx=26, pady=(4, 0))
+
+
+    def on_mode_changed(self):
+        manual = self.routing_var.get() == "manual"
+        for key, (model_label, combo, _reason) in self.assign_rows.items():
+            if manual:
+                model_label.pack_forget()
+                if not combo.winfo_ismapped():
+                    combo.pack(side="left")
+            else:
+                combo.pack_forget()
+                if not model_label.winfo_ismapped():
+                    model_label.pack(side="left")
+        self.refresh_models_display()
+
+    def goto_models(self):
+        try:
+            validate_request_text(self.request_text.get("1.0", "end"))
+        except ValueError:
+            messagebox.showwarning(
+                "アプリ案を入力してください",
+                "作りたいアプリの説明が空です。\n入力欄にアプリ案を書いてから「つぎへ」を押してください。",
+                parent=self.root)
+            self.request_text.focus_set()
+            return
+        self.refresh_models_display()
+        self.show_page("models")
+
+    def refresh_models_display(self):
+        # Welcome cards + models-page table share one computation.
         try:
             models = models_for_mode(
-                self.routing_var.get(),
-                self.model_var.get(),
-                stage_models,
-                installed_details=self.installed_details,
-            )
+                self.routing_var.get(), self.model_var.get(),
+                {k: v.get() for k, v in self.stage_model_vars.items()}
+                if self.routing_var.get() == "manual" else {},
+                installed_details=self.installed_details)
         except Exception:
             models = {key: "（未決定）" for key in STAGE_KEYS}
-        self.routing_summary.set(
-            f"開始前の割当 — PM・要件: {models['requirements']} / 設計: {models['design']} / "
-            f"実装: {models['implementation']} / QA: {models['qa']}"
-        )
+        reasons = {}
+        if self.routing_var.get() == "smart" and self.installed_details:
+            try:
+                _a, reasons, _s = app_builder.smart_route_models(self.installed_details)
+            except Exception:
+                reasons = {}
+        for key, _e, _n, _r in DEPARTMENTS:
+            name = models.get(key, "―")
+            if key in self.dept_card_models:
+                self.dept_card_models[key].configure(text=name)
+            if key in self.assign_rows:
+                model_label, _combo, reason_label = self.assign_rows[key]
+                model_label.configure(text=name)
+                reason_label.configure(text=("選んだ理由: " + reasons[key]) if reasons.get(key) else "")
         if self.installed_models is not None:
             if self.routing_var.get() == "smart":
-                status = "自動モード: 導入済みモデルから部署ごとに割り当てます。"
+                self.models_note.configure(
+                    text="自動モードでは、理想のモデルが入っていなくても止まらず、今あるモデルの中で一番良い割り当てで進みます。")
             else:
                 absent = missing_models(models, self.installed_models)
-                status = ("必要モデル未導入: " + ", ".join(absent)) if absent else "選択中のモデルは利用可能です。"
-            self.model_status.configure(text=f"Ollama接続済み。{status}")
+                self.models_note.configure(
+                    text=("注意: 未導入のモデルがあります ― " + ", ".join(absent) +
+                          "（開始前に案内が出ます）") if absent else "選択中のモデルはすべて利用できます。")
+
+    # ---- page: run ----
+    def _page_run(self, page):
+        nav = self._nav_row(page)
+        self.stop_button = self._big_button(nav, "■ 中止する", self.stop_generation, danger=True)
+        self.stop_button.pack(side="left")
+        tk.Label(nav, text="中止しても、完了した部署の成果は残ります（「つづきから再開」で続けられます）",
+                 font=self.F(11), fg=MUTED, bg=BG).pack(side="left", padx=(14, 0))
+        self._page_title(page, "③ AI社員が作成中です",
+                         "このままお待ちください。途中で止めても、できたところまでは保存されます。")
+        self.run_status = tk.Label(page, text="準備中…", font=self.F(16, True),
+                                   fg=PRIMARY_DARK, bg=BG, anchor="w")
+        self.run_status.pack(fill="x", padx=26, pady=(2, 10))
+        rows = tk.Frame(page, bg=BG)
+        rows.pack(fill="x", padx=26)
+        self.phase_widgets = {}
+        for idx, (key, emoji, dept_name, _role) in enumerate(DEPARTMENTS):
+            card = self._card(rows)
+            card.pack(fill="x", pady=(0, 8))
+            icon = tk.Label(card, text="○", font=self.F(22, True), fg=MUTED, bg=CARD, width=2)
+            icon.pack(side="left")
+            middle = tk.Frame(card, bg=CARD)
+            middle.pack(side="left", fill="x", expand=True)
+            tk.Label(middle, text=f"{emoji} {dept_name}", font=self.F(16, True),
+                     fg=INK, bg=CARD, anchor="w").pack(side="left")
+            model_line = tk.Label(middle, text="", font=self.F(12), fg=MUTED, bg=CARD, anchor="w")
+            model_line.pack(side="left", padx=(14, 0))
+            state = tk.Label(card, text="待機中", font=self.F(13, True), fg=MUTED, bg=CARD)
+            state.pack(side="right")
+            self.phase_widgets[key] = (icon, model_line, state)
+        style = ttk.Style(self.root)
+        try:
+            style.configure("Big.Horizontal.TProgressbar", thickness=22)
+        except tk.TclError:
+            pass
+        self.progress_bar = ttk.Progressbar(page, mode="determinate", maximum=4, value=0,
+                                            style="Big.Horizontal.TProgressbar")
+        self.progress_bar.pack(fill="x", padx=26, pady=(2, 10))
+        toggle = tk.Checkbutton(page, text="作業ログを見る", variable=self.show_log_var,
+                                command=self._toggle_log, font=self.F(12), bg=BG, fg=MUTED,
+                                activebackground=BG, anchor="w")
+        toggle.pack(fill="x", padx=26)
+        self.log_text = scrolledtext.ScrolledText(page, height=6, wrap="word",
+                                                  font=self.F(11), state="disabled",
+                                                  padx=10, pady=8)
+        self.log_text.pack(fill="x", padx=26, pady=(4, 0))
+
+    def _toggle_log(self):
+        if self.show_log_var.get():
+            self.log_text.pack(fill="x", padx=26, pady=(4, 0))
+        else:
+            self.log_text.pack_forget()
+
+    def _set_phase(self, key, mode, state_text=None):
+        icon, _model_line, state = self.phase_widgets[key]
+        if mode == "done":
+            icon.configure(text="✓", fg=GREEN)
+            state.configure(text=state_text or "完了", fg=GREEN)
+        elif mode == "active":
+            icon.configure(text="▶", fg=PRIMARY)
+            state.configure(text=state_text or "作業中…", fg=PRIMARY_DARK)
+        elif mode == "error":
+            icon.configure(text="✖", fg=RED)
+            state.configure(text=state_text or "失敗", fg=RED)
+        else:
+            icon.configure(text="○", fg=MUTED)
+            state.configure(text=state_text or "待機中", fg=MUTED)
 
     def append_log(self, text):
         self.log_text.configure(state="normal")
@@ -473,54 +656,153 @@ class AppBuilderWindow:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def set_busy(self, busy, status=None):
-        self.busy = busy
-        self.start_button.configure(state="disabled" if busy else "normal")
-        self.check_button.configure(state="disabled" if busy else "normal")
-        if hasattr(self, "stop_button"):
-            self.stop_button.configure(state="normal" if busy else "disabled")
-        if hasattr(self, "resume_button"):
-            self.resume_button.configure(state="disabled" if busy else "normal")
+    # ---- page: done ----
+    def _page_done(self, page):
+        wrap = tk.Frame(page, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=26, pady=(30, 0))
+        self.done_icon = tk.Label(wrap, text="✓", font=self.F(54, True), fg=GREEN, bg=BG)
+        self.done_icon.pack()
+        self.done_title = tk.Label(wrap, text="", font=self.F(24, True), fg=NAVY, bg=BG,
+                                   wraplength=940, justify="center")
+        self.done_title.pack(pady=(6, 4))
+        self.done_message = tk.Label(wrap, text="", font=self.F(14), fg=MUTED, bg=BG,
+                                     wraplength=900, justify="center")
+        self.done_message.pack()
+        self.done_path = tk.Label(wrap, text="", font=self.F(11), fg=MUTED, bg=BG,
+                                  wraplength=900, justify="center")
+        self.done_path.pack(pady=(8, 18))
+        buttons = tk.Frame(wrap, bg=BG)
+        buttons.pack()
+        self.preview_button = self._big_button(buttons, "▶ 生成したアプリを開く", self.preview_output, primary=True)
+        self.preview_button.pack(pady=(0, 10))
+        row = tk.Frame(buttons, bg=BG)
+        row.pack()
+        self.open_button = self._big_button(row, "フォルダーを開く", self.open_output)
+        self.open_button.pack(side="left")
+        self._big_button(row, "GitHubへ公開する", self.goto_publish).pack(side="left", padx=(12, 0))
+        self._big_button(row, "新しいアプリを作る", self.new_app).pack(side="left", padx=(12, 0))
+        self.resume_done_button = self._big_button(buttons, "つづきから再開する", self.resume_generation, primary=True)
+
+    def new_app(self):
+        self.request_text.delete("1.0", "end")
+        self.show_page("idea")
+
+    def goto_publish(self):
+        if not self.output_ready:
+            messagebox.showinfo("GitHub公開", "先にアプリの生成が完了してから公開できます。", parent=self.root)
+            return
+        self.show_page("publish")
+
+    def _show_done(self, code, output):
+        output = Path(output)
+        self.progress_bar.configure(value=4 if code in (0, 2) else self.progress_bar["value"])
+        if code == 0:
+            self.done_icon.configure(text="✓", fg=GREEN)
+            self.done_title.configure(text="アプリが完成しました！")
+            self.done_message.configure(
+                text="QA（検査）の承認も取れています。まず「生成したアプリを開く」で、実際に動くか確かめてみてください。")
+            self.resume_done_button.pack_forget()
+            self.preview_button.pack(pady=(0, 10))
+        elif code == 2:
+            self.done_icon.configure(text="⚠", fg=AMBER)
+            self.done_title.configure(text="アプリは保存されました（QAは未承認）")
+            self.done_message.configure(
+                text="動くアプリはできていますが、検査の承認までは至りませんでした。開いて確かめ、気になるところがあれば教えてください。")
+            self.resume_done_button.pack_forget()
+            self.preview_button.pack(pady=(0, 10))
+        elif code == 3:
+            self.done_icon.configure(text="■", fg=MUTED)
+            self.done_title.configure(text="中止しました")
+            self.done_message.configure(
+                text="完了した部署の成果は保存されています。「つづきから再開する」で、残りの部署だけを実行できます。")
+            self.preview_button.pack_forget()
+            self.resume_done_button.pack(pady=(0, 10))
+        else:
+            self.done_icon.configure(text="✖", fg=RED)
+            self.done_title.configure(text="途中で止まりました")
+            self.done_message.configure(
+                text="完了した部署の成果は保存されています。もう一度「つづきから再開する」と、続きだけを実行できます。原因は作業ログと保存先の run.json に残っています。")
+            self.preview_button.pack_forget()
+            self.resume_done_button.pack(pady=(0, 10))
+        self.done_path.configure(text=f"保存先: {output}")
+        self.show_page("done")
+
+    # ---- page: publish ----
+    def _page_publish(self, page):
+        nav = self._nav_row(page)
+        self._big_button(nav, "← 結果画面にもどる", lambda: self.show_page("done")).pack(side="left")
+        self.publish_button = self._big_button(nav, "GitHubへアップロード", self.start_publication, primary=True)
         self.publish_button.configure(state="disabled")
-        for control in self.input_controls:
-            if isinstance(control, scrolledtext.ScrolledText):
-                control.configure(state="disabled" if busy else "normal")
-            elif control in self.stage_model_entries.values():
-                control.configure(state="disabled")
-            elif isinstance(control, ttk.Combobox):
-                control.configure(state="disabled" if busy else "readonly")
-            elif control is self.model_entry:
-                control.configure(state="disabled" if busy else "normal")
-            else:
-                control.configure(state="disabled" if busy else "normal")
-        if status:
-            self.status_var.set(status)
-        if not busy:
-            self.on_routing_changed()
-            self.update_publish_button()
+        self.publish_button.pack(side="right")
+        self._page_title(page, "GitHubへ公開する",
+                         "完成したアプリ（index.html）を、あなたの公開リポジトリへアップロードします。公開すると、誰でも見られるようになります。")
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="x", padx=26)
+        tk.Label(body, text="公開先リポジトリのURL", font=self.F(14, True), fg=INK, bg=BG,
+                 anchor="w").pack(fill="x")
+        self.repository_url_entry = tk.Entry(body, textvariable=self.repository_url_var,
+                                             font=self.F(14))
+        self.repository_url_entry.pack(fill="x", ipady=8, pady=(4, 4))
+        tk.Label(body, text="例: https://github.com/あなたの名前/アプリ名　（空の公開リポジトリを先に作ってください）",
+                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x")
+        self.publication_review_check = tk.Checkbutton(
+            body, text="アプリの内容を確認しました。公開リポジトリで誰でも見られることを理解しています。",
+            variable=self.publication_reviewed_var, command=self.update_publish_button,
+            font=self.F(13), bg=BG, fg=INK, activebackground=BG, wraplength=920,
+            justify="left", anchor="w")
+        self.publication_review_check.pack(fill="x", pady=(16, 6))
+        self.publication_status_var = tk.StringVar(
+            value="このアプリはリポジトリを作成せず、Pagesの有効化もしません（アップロードだけを行います）。")
+        tk.Label(body, textvariable=self.publication_status_var, font=self.F(12),
+                 fg=MUTED, bg=BG, anchor="w", wraplength=920, justify="left").pack(fill="x")
+        self.repository_url_var.trace_add("write", lambda *_: self.update_publish_button())
 
     def update_publish_button(self):
         if not hasattr(self, "publish_button"):
             return
-        ready = (
-            not self.busy
-            and self.output_ready
-            and bool(self.repository_url_var.get().strip())
-            and self.publication_reviewed_var.get()
-        )
+        ready = (not self.busy and self.output_ready
+                 and bool(self.repository_url_var.get().strip())
+                 and self.publication_reviewed_var.get())
         self.publish_button.configure(state="normal" if ready else "disabled")
 
+    # ---- page: settings ----
+    def _page_settings(self, page):
+        nav = self._nav_row(page)
+        self._big_button(nav, "← もどる", lambda: self.show_page("welcome"), primary=True).pack(side="left")
+        self._page_title(page, "設定",
+                         "通常は変更しなくて大丈夫です。動作が重いときは、コンテキストを 2048 に下げると軽くなります。")
+        body = self._card(page)
+        body.pack(fill="x", padx=26)
+        fields = (
+            ("Ollamaの接続先", self.endpoint_var, None),
+            ("単一モードのモデル", self.model_var, "「単一モデル」モードと、手動モードで空欄の部署に使います"),
+            ("コンテキスト（大きいほど賢いが重い）", self.context_var, "2048 / 4096 / 8192 から選びます。実装の部署だけ自動で最大8192まで広がります"),
+            ("タイムアウト（秒）", self.timeout_var, "1回の生成を待つ上限です。遅いPCでは 900〜1200 が目安です"),
+        )
+        self._settings_entries = {}
+        for label, var, note in fields:
+            tk.Label(body, text=label, font=self.F(13, True), fg=INK, bg=CARD,
+                     anchor="w").pack(fill="x", pady=(10, 2))
+            if var is self.context_var:
+                widget = ttk.Combobox(body, textvariable=var, values=("2048", "4096", "8192"),
+                                      font=self.F(14), width=16, state="readonly")
+                widget.pack(anchor="w", ipady=4)
+            else:
+                widget = tk.Entry(body, textvariable=var, font=self.F(14), width=52)
+                widget.pack(anchor="w", fill="x", ipady=5)
+            self._settings_entries[label] = widget
+            if note:
+                tk.Label(body, text=note, font=self.F(11), fg=MUTED, bg=CARD,
+                         anchor="w").pack(fill="x")
+
+    # ---- connection check ----
     def check_connection(self):
-        if self.busy:
+        if self.busy or self.checking:
             return
-        endpoint = self.endpoint_var.get().strip()
-        self.set_busy(True, "Ollamaとモデルを確認中...")
-        self.model_status.configure(text="ローカルOllamaに接続しています...")
-        threading.Thread(
-            target=self._check_worker,
-            args=(endpoint,),
-            daemon=True,
-        ).start()
+        self.checking = True
+        self.conn_label.configure(text="● Ollamaを確認しています…", fg=MUTED)
+        threading.Thread(target=self._check_worker,
+                         args=(self.endpoint_var.get().strip(),), daemon=True).start()
 
     def _check_worker(self, endpoint):
         try:
@@ -529,49 +811,29 @@ class AppBuilderWindow:
         except Exception as exc:
             self.events.put(("check_error", str(exc)))
 
+    # ---- run control ----
     def _build_args_and_required(self):
-        stage_values = (
-            {key: value.get() for key, value in self.stage_model_vars.items()}
-            if self.routing_var.get() == "manual" else {}
-        )
+        stage_values = ({k: v.get() for k, v in self.stage_model_vars.items()}
+                        if self.routing_var.get() == "manual" else {})
         args = build_run_args(
-            self.endpoint_var.get().strip(),
-            self.model_var.get(),
-            stage_values,
-            self.context_var.get(),
-            self.routing_var.get(),
-            self.timeout_var.get(),
-        )
-        required = models_for_mode(
-            args.routing_mode,
-            args.model,
-            stage_values,
-            installed_details=self.installed_details,
-        )
+            self.endpoint_var.get().strip(), self.model_var.get(), stage_values,
+            self.context_var.get(), self.routing_var.get(), self.timeout_var.get())
+        required = models_for_mode(args.routing_mode, args.model, stage_values,
+                                   installed_details=self.installed_details)
         return args, required
 
     def start_generation(self):
-        try:
-            request = validate_request_text(self.request_text.get("1.0", "end"))
-        except ValueError:
-            messagebox.showwarning(
-                "アプリ案を入力してください",
-                "作りたいアプリの説明が空です。\n入力欄にアプリ案を書いてから「アプリを作成」を押してください。",
-                parent=self.root,
-            )
-            self.request_text.focus_set()
+        if self.busy:
             return
         try:
+            request = validate_request_text(self.request_text.get("1.0", "end"))
             validate_local_endpoint(self.endpoint_var.get())
             args, required = self._build_args_and_required()
             if self.routing_var.get() == "manual" and any(
-                not value.get().strip() for value in self.stage_model_vars.values()
-            ):
-                messagebox.showinfo(
-                    "部署別モデル設定",
-                    "空欄の部署には単一モデル欄のモデルを使います。",
-                    parent=self.root,
-                )
+                    not v.get().strip() for v in self.stage_model_vars.values()):
+                messagebox.showinfo("部署別モデル設定",
+                                    "空欄の部署には「単一モードのモデル」を使います。",
+                                    parent=self.root)
         except (ValueError, SystemExit) as exc:
             if isinstance(exc, SystemExit):
                 return
@@ -586,8 +848,7 @@ class AppBuilderWindow:
         chosen = filedialog.askdirectory(
             title="再開する実行フォルダーを選んでください（run.json のあるフォルダー）",
             initialdir=str(runs_root) if runs_root.exists() else str(Path(__file__).resolve().parent),
-            parent=self.root,
-        )
+            parent=self.root)
         if not chosen:
             return
         run_dir = Path(chosen)
@@ -614,28 +875,27 @@ class AppBuilderWindow:
             return
         self.request_text.delete("1.0", "end")
         self.request_text.insert("1.0", request)
-        self.append_log(f"再開します: {run_dir}")
         self._begin_run(request, required, args, resume_dir=run_dir)
 
     def _begin_run(self, request, required, args, resume_dir):
+        self.busy = True
         self.cancel_event = threading.Event()
-        self.set_busy(True, "接続とモデルを事前確認中...")
         self.output_ready = False
         self.publication_reviewed_var.set(False)
-        self.publication_status_var.set("生成が完了し、HTMLを確認するとアップロードできます。")
         self.active_models = required
-        self.model_status.configure(text="実行に必要なモデルを確認しています...")
-        self.append_log("入力を受け付けました。Ollama接続と必要モデルを確認します。")
+        for key, _e, _n, _r in DEPARTMENTS:
+            _icon, model_line, _state = self.phase_widgets[key]
+            model_line.configure(text=f"担当モデル: {required.get(key, '')}")
+            self._set_phase(key, "wait")
         self.progress_bar.configure(value=0)
-        stage_keys = STAGE_KEYS
-        for position, phase in enumerate(PHASES):
-            model_name = required.get(stage_keys[position], "")
-            self.phase_vars[phase].set(f"○ {phase}" + (f" — {model_name}" if model_name and "自動決定" not in model_name else ""))
-        threading.Thread(
-            target=self._generation_worker,
-            args=(request, required, args, resume_dir),
-            daemon=True,
-        ).start()
+        self.run_status.configure(text="Ollamaとモデルを確認しています…")
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.append_log("入力を受け付けました。Ollama接続と必要モデルを確認します。")
+        self.show_page("run")
+        threading.Thread(target=self._generation_worker,
+                         args=(request, required, args, resume_dir), daemon=True).start()
 
     def _generation_worker(self, request, required, args, resume_dir=None):
         try:
@@ -652,14 +912,11 @@ class AppBuilderWindow:
                 run_dir = app_builder.create_run_directory(output_root)
             self.events.put(("output", str(run_dir)))
             exit_code = app_builder.run_pipeline(
-                request,
-                args,
-                run_dir,
+                request, args, run_dir,
                 progress_callback=lambda line: self.events.put(("progress", line)),
                 token_callback=lambda stage, chars: self.events.put(("tokens", (stage, chars))),
                 cancel_event=self.cancel_event,
-                resume=resume_dir is not None,
-            )
+                resume=resume_dir is not None)
             self.events.put(("finished", (exit_code, str(run_dir))))
         except Exception as exc:
             self.events.put(("worker_error", str(exc)))
@@ -667,7 +924,7 @@ class AppBuilderWindow:
     def stop_generation(self):
         if self.cancel_event is not None:
             self.cancel_event.set()
-            self.status_var.set("中止しています…（現在の文字の区切りで止まります）")
+            self.run_status.configure(text="中止しています…（現在の文字の区切りで止まります）")
             self.append_log("中止ボタンが押されました。完了済みの工程は保存されています。")
 
     def preview_output(self):
@@ -679,22 +936,29 @@ class AppBuilderWindow:
             return
         webbrowser.open(html_path.resolve().as_uri())
 
+    def open_output(self):
+        if not self.last_output or not Path(self.last_output).exists():
+            messagebox.showinfo("出力先", "まだ出力フォルダーは作成されていません。", parent=self.root)
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(self.last_output))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(self.last_output)])
+            else:
+                subprocess.Popen(["xdg-open", str(self.last_output)])
+        except OSError as exc:
+            messagebox.showerror("フォルダーを開けません", error_guidance("出力フォルダーを開く", exc), parent=self.root)
+
+    # ---- GitHub publication (unchanged flow, own screen) ----
     def start_publication(self):
         if self.busy:
             return
         if not self.output_ready or not self.last_output:
-            messagebox.showwarning(
-                "生成HTMLがありません",
-                "先にアプリを生成し、出力された index.html を確認してください。",
-                parent=self.root,
-            )
+            messagebox.showwarning("生成HTMLがありません", "先にアプリを生成し、出力された index.html を確認してください。", parent=self.root)
             return
         if not self.publication_reviewed_var.get():
-            messagebox.showwarning(
-                "公開前の確認が必要です",
-                "HTMLの内容と、公開リポジトリでは誰でも閲覧できることを確認してください。",
-                parent=self.root,
-            )
+            messagebox.showwarning("公開前の確認が必要です", "HTMLの内容と、公開リポジトリでは誰でも閲覧できることを確認してください。", parent=self.root)
             return
         repository_url = self.repository_url_var.get().strip()
         try:
@@ -702,16 +966,12 @@ class AppBuilderWindow:
         except ValueError as exc:
             messagebox.showerror("リポジトリURLを確認してください", str(exc), parent=self.root)
             return
-
         output = self.last_output
-        self.set_busy(True, "GitHubの認証とリポジトリを確認中...")
+        self.busy = True
+        self.publish_button.configure(state="disabled")
         self.publication_status_var.set("GitHubログイン、公開設定、書き込み権限、Git接続を確認しています...")
-        self.append_log(f"GitHub公開の事前確認を開始: {repository_url}")
-        threading.Thread(
-            target=self._publication_preflight_worker,
-            args=(repository_url, output),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._publication_preflight_worker,
+                         args=(repository_url, output), daemon=True).start()
 
     def _publication_preflight_worker(self, repository_url, output):
         try:
@@ -724,9 +984,8 @@ class AppBuilderWindow:
         qa_status = "未承認" if self._run_is_unapproved(output) else "承認済み"
         branch_description = (
             "空のリポジトリに main ブランチを作成します。"
-            if target.empty
-            else f"既存の {target.default_branch} ブランチに index.html を追加します。"
-        )
+            if target.empty else
+            f"既存の {target.default_branch} ブランチに index.html を追加します。")
         prompt = (
             f"公開先: {target.repo_url}\n"
             "リポジトリは公開状態で、ソースも誰でも閲覧できます。\n"
@@ -737,8 +996,7 @@ class AppBuilderWindow:
             f"アップロード後、GitHubのSettings > PagesでDeploy from a branchを選んでください。\n"
             f"想定URL: {target.pages_url}\n"
             "Pagesを有効化するまでは、このURLは利用できません。\n\n"
-            "GitHubへアップロードしますか？"
-        )
+            "GitHubへアップロードしますか？")
         return messagebox.askyesno("公開内容を最終確認", prompt, parent=self.root)
 
     @staticmethod
@@ -752,228 +1010,130 @@ class AppBuilderWindow:
     def _publication_worker(self, repository_url, output, target):
         try:
             result = github_publish.publish_public_pages(
-                output,
-                repository_url,
-                target,
-                progress_callback=lambda line: self.events.put(("publish_progress", line)),
-            )
+                output, repository_url, target,
+                progress_callback=lambda line: self.events.put(("publish_progress", line)))
             self.events.put(("publish_finished", result))
         except Exception as exc:
             self.events.put(("publish_error", exc))
 
+    # ---- event loop ----
     def process_events(self):
         try:
             while True:
                 kind, data = self.events.get_nowait()
                 if kind == "models":
+                    self.checking = False
                     if data and isinstance(data[0], dict):
                         self.installed_details = data
                         self.installed_models = [item["name"] for item in data]
                     else:
                         self.installed_models = list(data)
-                        self.installed_details = [{"name": name, "size": 0, "details": {}} for name in self.installed_models]
-                    names = self.installed_models
-                    for combo in self.stage_model_entries.values():
-                        combo.configure(values=names)
-                    self.refresh_routing_summary()
-                    if self.routing_var.get() == "smart":
-                        absent = [] if names else ["（モデルが1つも導入されていません）"]
-                    else:
-                        absent = missing_models(
-                            models_for_mode(
-                                self.routing_var.get(),
-                                self.model_var.get(),
-                                {key: value.get() for key, value in self.stage_model_vars.items()},
-                                installed_details=self.installed_details,
-                            ),
-                            names,
-                        )
-                    self.set_busy(False, "準備完了" if not absent else "モデルを導入してください")
-                    self.append_log("Ollama接続を確認しました。")
-                    if absent:
-                        self.append_log(
-                            error_guidance(
-                                "モデル確認",
-                                "指定モデルが未導入です。",
-                                absent,
-                            )
-                        )
+                        self.installed_details = [{"name": n, "size": 0, "details": {}} for n in self.installed_models]
+                    for _k, (_l, combo, _r) in self.assign_rows.items():
+                        combo.configure(values=self.installed_models)
+                    self.conn_label.configure(
+                        text=f"● Ollama接続済み（モデル {len(self.installed_models)} 本）", fg=GREEN)
+                    self.conn_detail.configure(text=" / ".join(self.installed_models[:4]))
+                    self.refresh_models_display()
                 elif kind == "check_error":
-                    self.model_status.configure(text="Ollamaを確認できませんでした。")
-                    self.set_busy(False, "接続を確認してください")
-                    self.append_log(error_guidance("接続確認", data))
+                    self.checking = False
+                    self.conn_label.configure(text="● Ollamaに接続できません", fg=RED)
+                    self.conn_detail.configure(text="Ollamaアプリを起動してから「再確認」を押してください")
                 elif kind == "missing_models":
                     absent, installed = data
                     self.installed_models = installed
+                    self.busy = False
                     advice = error_guidance("モデル確認", "指定モデルが未導入です。", absent)
-                    self.model_status.configure(
-                        text="未導入モデル: " + ", ".join(absent)
-                    )
-                    self.append_log(advice)
                     messagebox.showerror("モデルが見つかりません", advice, parent=self.root)
-                    self.set_busy(False, "モデルを導入後に再実行してください")
+                    self.show_page("models")
                 elif kind == "tokens":
                     stage, chars = data
-                    label = {"requirements": "PM・要件定義", "design": "デザイン設計", "implementation": "実装", "qa": "QA"}.get(stage, stage)
                     if not (self.cancel_event is not None and self.cancel_event.is_set()):
-                        self.status_var.set(f"{label}を生成中… {chars}文字")
+                        dept = {"requirements": "PM・要件定義", "design": "デザイン設計",
+                                "implementation": "実装", "qa": "QA・検査"}.get(stage, stage)
+                        self.run_status.configure(text=f"{dept}が生成中… {chars}文字")
+                        if stage in self.phase_widgets:
+                            self._set_phase(stage, "active", f"生成中… {chars}文字")
                 elif kind == "output":
                     self.last_output = Path(data)
-                    self.open_button.configure(state="normal")
-                    self.status_var.set("生成中...")
                 elif kind == "progress":
-                    self.update_progress(data)
                     self.append_log(data)
+                    self._handle_progress_line(data)
                 elif kind == "finished":
                     code, output = data
                     self.last_output = Path(output)
-                    self.open_button.configure(state="normal")
-                    self.preview_button.configure(state="normal" if (self.last_output / "index.html").is_file() else "disabled")
+                    self.busy = False
                     self.output_ready = code in (0, 2) and (self.last_output / "index.html").is_file()
-                    self.set_busy(False)
-                    if code == 3:
-                        self.status_var.set("中止しました（途中成果は保存済み・再開できます）")
-                        self.progress_bar.configure(value=0)
-                        self.append_log(f"中止しました。保存先: {output}。「つづきから再開」で続きを実行できます。")
-                    elif code == 0:
-                        self.status_var.set("完了（AI QA承認）")
-                        self.append_log(f"完了しました。保存先: {output}")
-                    elif code == 2:
-                        self.status_var.set("未承認（HTMLは保存済み）")
-                        self.append_log(f"QA未承認です。保存済みHTMLを確認してください: {output}")
-                        messagebox.showwarning(
-                            "QA未承認",
-                            f"処理は完了しましたが、QAの承認は得られていません。\n"
-                            f"HTMLとQA結果を確認してください。\n\n保存先:\n{output}",
-                            parent=self.root,
-                        )
-                    else:
-                        self.show_run_error(Path(output))
+                    for key, _e, _n, _r in DEPARTMENTS:
+                        if code in (0, 2):
+                            self._set_phase(key, "done")
+                    self._show_done(code, output)
                     self.update_publish_button()
                 elif kind == "publish_preflight_ready":
                     target, output = data
                     if self._confirm_publication(target, output):
                         self.publication_status_var.set("確認済み。index.htmlをアップロードしています...")
-                        self.append_log(f"公開先を確認しました: {target.repo_url}")
-                        threading.Thread(
-                            target=self._publication_worker,
-                            args=(self.repository_url_var.get().strip(), output, target),
-                            daemon=True,
-                        ).start()
+                        threading.Thread(target=self._publication_worker,
+                                         args=(self.repository_url_var.get().strip(), output, target),
+                                         daemon=True).start()
                     else:
-                        self.set_busy(False, "公開をキャンセルしました")
+                        self.busy = False
                         self.publication_status_var.set("アップロードはキャンセルされました。")
+                        self.update_publish_button()
                 elif kind == "publish_progress":
                     self.publication_status_var.set(data)
-                    self.append_log(data)
                 elif kind == "publish_finished":
+                    self.busy = False
                     self.output_ready = False
-                    self.set_busy(False)
-                    self.publication_status_var.set(
-                        f"HTMLをアップロードしました。Pagesは未有効: {data.pages_url}"
-                    )
-                    self.status_var.set("アップロード完了・Pages未有効")
-                    self.append_log(data.details)
-                    self.append_log(f"GitHub Pagesの設定後に利用するURL: {data.pages_url}")
+                    self.publication_status_var.set(f"HTMLをアップロードしました。Pagesは未有効: {data.pages_url}")
                     messagebox.showinfo(
                         "HTMLをアップロードしました",
-                        f"{data.details}\n\n"
-                        f"リポジトリ:\n{data.repo_url}\n\n"
+                        f"{data.details}\n\nリポジトリ:\n{data.repo_url}\n\n"
                         f"Pages有効化後のURL:\n{data.pages_url}\n\n"
                         "URLはPagesを設定してデプロイが完了するまで利用できません。",
-                        parent=self.root,
-                    )
+                        parent=self.root)
+                    self.update_publish_button()
                 elif kind == "publish_error":
-                    self.set_busy(False, "GitHubアップロードを完了できませんでした")
+                    self.busy = False
                     advice = publication_guidance(data)
                     self.publication_status_var.set("アップロードを中止しました。既存内容は上書きしていません。")
-                    self.append_log(advice)
                     messagebox.showerror("GitHub公開を完了できませんでした", advice, parent=self.root)
+                    self.update_publish_button()
                 elif kind == "worker_error":
-                    self.set_busy(False, "処理を開始できませんでした")
-                    self.append_log(error_guidance("事前確認・実行", data))
-                    messagebox.showerror(
-                        "実行できませんでした",
-                        error_guidance("事前確認・実行", data),
-                        parent=self.root,
-                    )
+                    self.busy = False
+                    messagebox.showerror("実行できませんでした", error_guidance("事前確認・実行", data), parent=self.root)
+                    self._show_done(1, self.last_output or Path("."))
         except queue.Empty:
             pass
         self.root.after(150, self.process_events)
 
-    def update_progress(self, line):
+    def _handle_progress_line(self, line):
         index = progress_phase(line)
         if index is not None:
-            phase_model_key = ("requirements", "design", "implementation", "qa")[index]
-            phase_model = self.active_models.get(phase_model_key, "")
-            for position, phase in enumerate(PHASES):
-                if position < index:
-                    marker = "✓"
-                elif position == index:
-                    marker = "▶"
-                else:
-                    marker = "○"
-                model_text = f" — {phase_model}" if position == index and phase_model else ""
-                self.phase_vars[phase].set(f"{marker} {phase}{model_text}")
-            self.status_var.set(
-                f"{PHASES[index]}: {phase_model} をロード/実行中..."
-                if phase_model
-                else f"{PHASES[index]}を処理中..."
-            )
-        if index is not None:
+            keys = [k for k, _e, _n, _r in DEPARTMENTS]
+            for pos, key in enumerate(keys):
+                if pos < index:
+                    self._set_phase(key, "done")
+                elif pos == index:
+                    self._set_phase(key, "active")
             self.progress_bar.configure(value=index + 1)
+            self.run_status.configure(text=f"{DEPARTMENTS[index][2]}の作業中です…")
+        if "[REPAIR]" in line:
+            self.run_status.configure(text="実装を自動で直しています…")
+            self._set_phase("implementation", "active", "自動修復中…")
+        if "[QA]" in line:
+            self._set_phase("qa", "active")
         if "[DONE]" in line:
             self.progress_bar.configure(value=4)
-            for phase in PHASES:
-                self.phase_vars[phase].set(f"✓ {phase}")
-
-    def show_run_error(self, run_dir):
-        stage = "実行"
-        error = "詳しいエラー情報を確認できませんでした。"
-        try:
-            manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-            stage = manifest.get("failed_stage", stage)
-            error = manifest.get("error", error)
-        except (OSError, json.JSONDecodeError):
-            pass
-        self.status_var.set("途中で停止しました")
-        advice = error_guidance(stage, error)
-        self.append_log(advice)
-        messagebox.showerror(
-            "途中で停止しました",
-            advice + f"\n\n途中成果物・ログの保存先:\n{run_dir}",
-            parent=self.root,
-        )
-
-    def open_output(self):
-        if not self.last_output or not self.last_output.exists():
-            messagebox.showinfo("出力先", "まだ出力フォルダーは作成されていません。", parent=self.root)
-            return
-        try:
-            if os.name == "nt":
-                os.startfile(str(self.last_output))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(self.last_output)])
-            else:
-                subprocess.Popen(["xdg-open", str(self.last_output)])
-        except OSError as exc:
-            messagebox.showerror(
-                "フォルダーを開けません",
-                error_guidance("出力フォルダーを開く", exc),
-                parent=self.root,
-            )
 
     def on_close(self):
         if self.busy:
-            if self.cancel_event is not None and not self.cancel_event.is_set():
+            if self.cancel_event is not None:
                 self.cancel_event.set()
-                messagebox.showinfo(
-                    "中止して終了します",
-                    "生成を中止します。完了済みの工程は保存されており、次回「つづきから再開」できます。",
-                    parent=self.root,
-                )
-            self.root.destroy()
-            return
+            messagebox.showinfo(
+                "中止して終了します",
+                "生成を中止します。完了済みの工程は保存されており、次回「つづきから再開」できます。",
+                parent=self.root)
         self.root.destroy()
 
 
