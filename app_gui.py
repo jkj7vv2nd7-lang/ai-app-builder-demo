@@ -281,7 +281,7 @@ class AppBuilderWindow:
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.2")
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.3")
         root.geometry("1060x830")
         root.minsize(920, 700)
         root.configure(bg=BG)
@@ -378,7 +378,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.2 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.3 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)
@@ -741,7 +741,10 @@ class AppBuilderWindow:
         self.done_message.pack()
         self.done_path = tk.Label(wrap, text="", font=self.F(11), fg=MUTED, bg=BG,
                                   wraplength=900, justify="center")
-        self.done_path.pack(pady=(4, 8))
+        self.done_path.pack(pady=(4, 2))
+        self.done_file_label = tk.Label(wrap, text="", font=self.F(15, True), fg=NAVY, bg=BG,
+                                        wraplength=900, justify="center")
+        self.done_file_label.pack(pady=(0, 8))
         self.done_feedback_card = self._card(wrap)
         self.done_feedback_card.pack(fill="x", pady=(2, 10))
         tk.Label(self.done_feedback_card, text="できあがりはどうですか？",
@@ -761,7 +764,7 @@ class AppBuilderWindow:
         self.done_feedback_note.pack(fill="x", pady=(6, 0))
         buttons = tk.Frame(wrap, bg=BG)
         buttons.pack()
-        self.preview_button = self._big_button(buttons, "▶ 生成したアプリを開く", self.preview_output, primary=True)
+        self.preview_button = self._big_button(buttons, "🌐 ブラウザーで開く（完成したアプリ）", self.preview_output, primary=True)
         self.preview_button.pack(pady=(0, 8))
         row = tk.Frame(buttons, bg=BG)
         row.pack()
@@ -850,6 +853,13 @@ class AppBuilderWindow:
                     text=self.done_message.cget("text") +
                     "\n\n※今回は前回と変わりませんでした。指摘の書き方を変えて（例: どの部分が・どう動かないか）、もう一度ダメ出ししてみてください。")
         self.done_path.configure(text=f"保存先: {output}")
+        if (output / "index.html").is_file():
+            self.done_file_label.configure(
+                text=f"完成したアプリのファイルは「{output.name}」フォルダーの中の index.html です")
+        elif (output / "index_draft_unverified.html").is_file():
+            self.done_file_label.configure(text="今回は下書き（index_draft_unverified.html）のみ保存されています")
+        else:
+            self.done_file_label.configure(text="")
         self.show_page("done")
 
     # ---- page: revision (ダメ出し) ----
@@ -1482,6 +1492,8 @@ class AppBuilderWindow:
         if "[QA] 指摘を実装部署で修正します" in line:
             self._set_activity(f"差し戻し{max(self.qa_round, 1)}回目：修正中")
             self._set_phase("implementation", "active", "差し戻しの修正中…")
+        if line.startswith("[RENDER]"):
+            self._set_activity("画面表示を自動確認中")
         if "[REPAIR]" in line:
             self._set_activity("自動修復中")
             self._set_phase("implementation", "active", "自動修復中…")

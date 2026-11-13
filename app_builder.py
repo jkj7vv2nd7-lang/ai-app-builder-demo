@@ -3,7 +3,9 @@
 
 import argparse
 import json
+import os
 import re
+import tempfile
 import secrets
 import shutil
 import socket
@@ -517,6 +519,164 @@ def run_browser_check(html_content):
     }
 
 
+def find_browser():
+    """Locate a local Edge/Chrome/Chromium for the headless render check."""
+    for name in ("msedge", "microsoft-edge", "google-chrome", "google-chrome-stable",
+                 "chrome", "chromium", "chromium-browser", "chrome-headless-shell"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = []
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        base = os.environ.get(env_name)
+        if base:
+            candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+            candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    candidates.append(Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"))
+    candidates.append(Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+class _RenderDomParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_body = False
+        self.skip_depth = 0
+        self.elements = 0
+        self.media = 0
+        self.text_chars = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "body":
+            self.in_body = True
+        if tag in ("script", "style", "noscript", "template"):
+            self.skip_depth += 1
+        if self.in_body and self.skip_depth == 0:
+            self.elements += 1
+            if tag in ("canvas", "svg", "img", "video", "audio"):
+                self.media += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "template") and self.skip_depth:
+            self.skip_depth -= 1
+        if tag == "body":
+            self.in_body = False
+
+    def handle_data(self, data):
+        if self.in_body and self.skip_depth == 0:
+            self.text_chars += len(data.strip())
+
+
+def _render_dom_stats(dom):
+    parser = _RenderDomParser()
+    try:
+        parser.feed(dom)
+        parser.close()
+    except Exception:
+        pass
+    return {
+        "visible_text_chars": parser.text_chars,
+        "element_count": parser.elements,
+        "media_count": parser.media,
+    }
+
+
+def check_render(html_content, work_dir=None):
+    """Render the app in a real (headless) browser and verify content shows.
+
+    Static validation cannot notice an app whose script fails at runtime and
+    leaves the screen empty. This check loads the page with local Edge/Chrome,
+    dumps the post-JS DOM and counts what a user would actually see.
+    """
+    exe = find_browser()
+    if not exe:
+        return {"available": False, "ok": None,
+                "reason": "Edge/Chromeが見つからないため、画面表示の自動確認は行いませんでした。",
+                "visible_text_chars": None, "element_count": None, "media_count": None,
+                "screenshot": None}
+    folder = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="render-check-"))
+    folder.mkdir(parents=True, exist_ok=True)
+    probe = folder / "_render_check.html"
+    probe.write_text(html_content, encoding="utf-8")
+    url = probe.as_uri()
+    dom = ""
+    last_error = ""
+    for headless_flag in ("--headless=new", "--headless"):
+        try:
+            result = subprocess.run(
+                [exe, headless_flag, "--disable-gpu", "--no-sandbox",
+                 "--hide-scrollbars", "--virtual-time-budget=5000",
+                 "--dump-dom", url],
+                capture_output=True, text=True, timeout=45, check=False)
+            dom = result.stdout or ""
+            last_error = (result.stderr or "").strip()[:300]
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = str(exc)
+            dom = ""
+        if "<html" in dom.lower():
+            break
+    if "<html" not in dom.lower():
+        return {"available": False, "ok": None,
+                "reason": f"ブラウザーで描画できませんでした: {last_error}",
+                "visible_text_chars": None, "element_count": None, "media_count": None,
+                "screenshot": None}
+    stats = _render_dom_stats(dom)
+    ok = (stats["visible_text_chars"] >= 4 or stats["element_count"] >= 5
+          or stats["media_count"] >= 1)
+    screenshot = None
+    if work_dir:
+        try:
+            shot = subprocess.run(
+                [exe, "--headless=new", "--disable-gpu", "--no-sandbox",
+                 "--hide-scrollbars", "--window-size=900,700",
+                 f"--screenshot={folder / 'render.png'}", url],
+                capture_output=True, text=True, timeout=45, check=False)
+            if (folder / "render.png").is_file():
+                screenshot = "render.png"
+        except (OSError, subprocess.TimeoutExpired):
+            screenshot = None
+    try:
+        probe.unlink()
+    except OSError:
+        pass
+    return {"available": True, "ok": ok,
+            "reason": "実ブラウザーで描画し、表示内容を数えました。",
+            "screenshot": screenshot, **stats}
+
+
+def render_defect_text(result):
+    if result and result.get("available") and result.get("ok") is False:
+        return ("自動の画面表示確認で、画面に中身がほとんど表示されていませんでした"
+                f"（表示テキスト{result.get('visible_text_chars')}文字・要素{result.get('element_count')}個）。"
+                "JavaScriptの実行エラーや描画漏れで中核コンテンツ（時計の文字盤など）が"
+                "表示されていない可能性があります。実際にブラウザーで開いたときに"
+                "中核コンテンツが見えるよう直してください。")
+    return None
+
+
+def write_run_guide(run_dir, request, status_text):
+    guide = (
+        "このフォルダーは「AIアプリ開発会社」が作ったアプリ一式です。\n\n"
+        "★ アプリ本体は「index.html」です。\n"
+        "　ダブルクリックするとブラウザーで開きます（会社の完成画面の「ブラウザーで開く」ボタンからも開けます）。\n"
+        "　ファイル名が index-3.html や index-4.html のようなものは、ブラウザーでページを保存したときに付く別名のコピーで、本体ではありません。\n\n"
+        "そのほかのファイル:\n"
+        "・ render.png … 会社が自動で撮った、アプリ画面の写真です（撮れた場合のみ）\n"
+        "・ 01_requirements.md … PMがまとめた要件定義\n"
+        "・ 02_design.md … デザイン設計（ダメ出しのときは 02_revision_plan.md）\n"
+        "・ 04_qa_round_*.md / 05_qa_result.md … QA（検査）の記録\n"
+        "・ run.json … 実行の記録（状態・使ったモデル・QAの指摘など）\n"
+        "・ run.log … 作業ログ\n"
+        "・ index_draft_unverified.html … 検証を通らなかった下書きです（ある場合のみ。本体ではありません）\n\n"
+        f"元の指示文: {request}\n"
+        f"状態: {status_text}\n"
+    )
+    (Path(run_dir) / "はじめにお読みください.txt").write_text(guide, encoding="utf-8")
+
+
 def selected_model(args, stage):
     resolved = getattr(args, "resolved_models", None)
     if isinstance(resolved, dict) and resolved.get(stage):
@@ -909,6 +1069,7 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
 
         # --- 4/4 QA review -> implementation repair loop ---
         log(f"[4/4] QAレビューを実行中...（{models['qa']}）")
+        render_result = {"available": False, "ok": None, "reason": "未実施"}
         qa_rounds = []
         qa_approved = False
         qa_note = ""
@@ -917,9 +1078,17 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
             round_label = round_number + 1
             check_cancel("qa")
             log(f"[QA] レビュー {round_label}/{max_rounds + 1}")
+            if render_result.get("_for") != current_html:
+                render_result = check_render(current_html, run_dir)
+                render_result["_for"] = current_html
+                if render_result.get("available"):
+                    log(f"[RENDER] 画面表示の自動確認: 表示テキスト{render_result.get('visible_text_chars')}文字・要素{render_result.get('element_count')}個 → {'問題なし' if render_result.get('ok') else '表示が不十分です'}")
+                else:
+                    log(f"[RENDER] 画面表示の自動確認は行いませんでした（{render_result.get('reason')}）")
             response = call(
                 "次の単一HTMLアプリを審査してください。HTML全体は返さず、判定とDEFECTSだけを返してください。\n\n"
-                f"受け入れ条件を含む要件:\n{requirements}\n\n現在のHTML:\n{current_html}",
+                f"受け入れ条件を含む要件:\n{requirements}\n\n現在のHTML:\n{current_html}\n\n"
+                f"自動の画面表示確認: 表示テキスト{render_result.get('visible_text_chars')}文字・要素{render_result.get('element_count')}個（available={render_result.get('available')}）",
                 QA_SYSTEM, "qa")
             (run_dir / f"04_qa_round_{round_label}.md").write_text(response.rstrip() + "\n", encoding="utf-8")
             qa_status = extract_qa_status(response)
@@ -932,8 +1101,11 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
                     current_html = returned_html
                     checks = returned_checks
                     (run_dir / "index.html").write_text(current_html.rstrip() + "\n", encoding="utf-8")
+            r_defect = render_defect_text(render_result)
+            if r_defect:
+                defects = (defects.rstrip() + "\n- " + r_defect) if defects.strip() else "- " + r_defect
             round_info = {"round": round_label, "ai_status": qa_status}
-            if qa_status == "APPROVED":
+            if qa_status == "APPROVED" and not r_defect:
                 qa_approved = True
                 qa_note = "AI QAは承認を返しました。"
                 round_info["result"] = "approved"
@@ -989,6 +1161,7 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
         }
         write_json(run_dir / "06_browser_check.json", browser_result)
         manifest["browser_check"] = browser_result
+        manifest["render_check"] = {k: v for k, v in render_result.items() if k != "_for"}
         final_defects = []
         if not qa_approved and qa_rounds:
             for line in str(qa_rounds[-1].get("defects") or "").splitlines():
@@ -1007,6 +1180,7 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
                 f"- ネットワークAPI検出: {json.dumps(checks['network_api_usage'], ensure_ascii=False)}\n"
                 f"- ブラウザー検証: {browser_result['status']} — {browser_result.get('reason', '')}\n"
             )
+        write_run_guide(run_dir, request_text, manifest["status"])
         log(f"[DONE] 状態: {manifest['status']}")
         log(f"[DONE] HTML: {run_dir / 'index.html'}")
         if checks["external_dependencies"] or checks["network_api_usage"]:
@@ -1201,6 +1375,7 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
 
         # --- [4/4] QA re-review, focused on the requested points ---
         log(f"[4/4] QAが再検査中...（{models['qa']}）")
+        render_result = {"available": False, "ok": None, "reason": "未実施"}
         qa_rounds = []
         qa_approved = False
         qa_note = ""
@@ -1209,16 +1384,27 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
             round_label = round_number + 1
             check_cancel("qa")
             log(f"[QA] レビュー {round_label}/{max_rounds + 1}")
+            if render_result.get("_for") != current_html:
+                render_result = check_render(current_html, run_dir)
+                render_result["_for"] = current_html
+                if render_result.get("available"):
+                    log(f"[RENDER] 画面表示の自動確認: 表示テキスト{render_result.get('visible_text_chars')}文字・要素{render_result.get('element_count')}個 → {'問題なし' if render_result.get('ok') else '表示が不十分です'}")
+                else:
+                    log(f"[RENDER] 画面表示の自動確認は行いませんでした（{render_result.get('reason')}）")
             response = call(
                 "次の単一HTMLアプリ（修正版）を審査してください。HTML全体は返さず、判定とDEFECTSだけを返してください。\n"
                 "特に、修正依頼の各点が反映されているかと、既存の中核機能が壊れていないかを確認してください。\n\n"
-                f"修正依頼:\n{notes}\n\n元の要件:\n{requirements or original_request}\n\n現在のHTML:\n{current_html}",
+                f"修正依頼:\n{notes}\n\n元の要件:\n{requirements or original_request}\n\n現在のHTML:\n{current_html}\n\n"
+                f"自動の画面表示確認: 表示テキスト{render_result.get('visible_text_chars')}文字・要素{render_result.get('element_count')}個（available={render_result.get('available')}）",
                 QA_SYSTEM, "qa")
             (run_dir / f"04_qa_round_{round_label}.md").write_text(response.rstrip() + "\n", encoding="utf-8")
             qa_status = extract_qa_status(response)
             defects = extract_qa_defects(response)
+            r_defect = render_defect_text(render_result)
+            if r_defect:
+                defects = (defects.rstrip() + "\n- " + r_defect) if defects.strip() else "- " + r_defect
             round_info = {"round": round_label, "ai_status": qa_status}
-            if qa_status == "APPROVED":
+            if qa_status == "APPROVED" and not r_defect:
                 qa_approved = True
                 qa_note = "AI QAは承認を返しました。"
                 round_info["result"] = "approved"
@@ -1265,6 +1451,7 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
         manifest["qa_note"] = qa_note
         manifest["static_checks"] = checks
         manifest["changed"] = current_html.strip() != source_html.strip()
+        manifest["render_check"] = {k: v for k, v in render_result.items() if k != "_for"}
         final_defects = []
         if not qa_approved and qa_rounds:
             for line in str(qa_rounds[-1].get("defects") or "").splitlines():
@@ -1277,6 +1464,8 @@ def run_revision(source_dir, notes, args, output_root, progress_callback=None,
         manifest["status"] = "completed" if qa_approved else "completed_unapproved"
         manifest["updated_at"] = datetime.now().astimezone().isoformat()
         write_json(manifest_path, manifest)
+        write_run_guide(run_dir, original_request,
+                        manifest["status"] + "（ダメ出しの修正版）")
         log(f"[DONE] 状態: {manifest['status']}")
         log(f"[DONE] HTML: {run_dir / 'index.html'}")
         if not manifest["changed"]:

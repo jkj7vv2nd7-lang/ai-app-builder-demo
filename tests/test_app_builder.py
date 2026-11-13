@@ -596,5 +596,73 @@ class ChangeHonestyTests(unittest.TestCase):
 
 
 
+class RenderCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model="test-model",
+            planning_model=None, design_model=None,
+            implementation_model=None, qa_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3, num_predict=256, num_ctx=2048, timeout=10,
+            max_qa_revisions=0, max_impl_repairs=2, browser_check=False,
+        )
+        self.html = (
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><main>Working app</main></body></html>"
+        )
+
+    def test_dom_stats_count_visible_content(self):
+        dom = ("<html><body><h1>時計</h1><div>12:00:00</div>"
+               "<script>var x = '見えない文字';</script></body></html>")
+        stats = app_builder._render_dom_stats(dom)
+        self.assertGreaterEqual(stats["visible_text_chars"], 9)
+        self.assertGreaterEqual(stats["element_count"], 2)
+
+    def test_render_unavailable_without_browser(self):
+        with patch.object(app_builder, "find_browser", return_value=None):
+            result = app_builder.check_render(self.html)
+        self.assertFalse(result["available"])
+        self.assertIsNone(app_builder.render_defect_text(result))
+
+    def test_render_defect_text_for_empty_render(self):
+        result = {"available": True, "ok": False,
+                  "visible_text_chars": 0, "element_count": 1}
+        self.assertIn("画面表示確認", app_builder.render_defect_text(result))
+
+    def test_pipeline_render_failure_blocks_approval(self):
+        bad_render = {"available": True, "ok": False, "reason": "test",
+                      "visible_text_chars": 0, "element_count": 1,
+                      "media_count": 0, "screenshot": None}
+        responses = ["Requirements", "Design", self.html,
+                     "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses), \
+                    patch.object(app_builder, "check_render", return_value=dict(bad_render)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = app_builder.run_pipeline("時計アプリ", self.args, run_dir)
+            manifest = app_builder.json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            guide_exists = (run_dir / "はじめにお読みください.txt").is_file()
+        self.assertEqual(code, 2)
+        self.assertTrue(any("画面表示確認" in d for d in manifest["qa_defects_final"]))
+        self.assertFalse(manifest["render_check"]["ok"])
+        self.assertTrue(guide_exists)
+
+    def test_pipeline_render_ok_allows_approval(self):
+        good_render = {"available": True, "ok": True, "reason": "test",
+                       "visible_text_chars": 20, "element_count": 5,
+                       "media_count": 0, "screenshot": None}
+        responses = ["Requirements", "Design", self.html,
+                     "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            run_dir = Path(temporary_dir)
+            with patch.object(app_builder, "call_ollama", side_effect=responses), \
+                    patch.object(app_builder, "check_render", return_value=dict(good_render)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = app_builder.run_pipeline("時計アプリ", self.args, run_dir)
+        self.assertEqual(code, 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()
