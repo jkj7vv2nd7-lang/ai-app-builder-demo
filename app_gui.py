@@ -274,6 +274,8 @@ class AppBuilderWindow:
         self.last_activity_at = None
         self.revision_target = None
         self.revision_return = "welcome"
+        self.external_folder = None
+        self.external_info = None
         self.activity_name = ""
         self.qa_round = 0
         self._fonts = []
@@ -281,7 +283,7 @@ class AppBuilderWindow:
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.4")
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.5")
         root.geometry("1060x830")
         root.minsize(920, 700)
         root.configure(bg=BG)
@@ -312,6 +314,7 @@ class AppBuilderWindow:
             ("run", self._page_run),
             ("done", self._page_done),
             ("revision", self._page_revision),
+            ("external", self._page_external),
             ("publish", self._page_publish),
             ("settings", self._page_settings),
         ):
@@ -417,7 +420,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.4 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.5 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)
@@ -437,6 +440,7 @@ class AppBuilderWindow:
         "run": "ステップ 3 / 4",
         "done": "ステップ 4 / 4",
         "revision": "ダメ出し（修正依頼）",
+        "external": "既存アプリの改修",
         "publish": "GitHub公開",
         "settings": "設定",
     }
@@ -472,6 +476,8 @@ class AppBuilderWindow:
             request = str(info.get("request") or run_dir.name)
             if info.get("mode") == "revision":
                 request = "（ダメ出しの修正版）" + request
+            elif info.get("mode") == "external_revision":
+                request = "（既存アプリの改修）" + request
             row = self._card(self.runs_list_frame)
             row.pack(fill="x", pady=(0, 8))
             left = tk.Frame(row, bg=CARD)
@@ -545,6 +551,12 @@ class AppBuilderWindow:
         tk.Label(page,
                  text="「つづきから再開」は途中で止まった作業の続き、「✎ ダメ出し」は完成した作品に直してほしいことを伝えて直してもらうときに使います。",
                  font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=26, pady=(6, 0))
+        ext_row = tk.Frame(page, bg=BG)
+        ext_row.pack(fill="x", padx=26, pady=(12, 0))
+        self._big_button(ext_row, "🔧 既存のアプリを直す・育てる", lambda: self.show_page("external")).pack(side="left")
+        tk.Label(ext_row,
+                 text="会社以外で作ったアプリや作りかけのアプリも、フォルダーを選んで依頼できます（元のフォルダーは変更しません）。",
+                 font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(side="left", padx=(12, 0))
         tk.Label(page, text="これまでの作品", font=self.F(17, True), fg=NAVY, bg=BG,
                  anchor="w").pack(fill="x", padx=26, pady=(10, 2))
         tk.Label(page, text="作品ごとに、そのまま「ダメ出し」や「つづき」ができます。",
@@ -882,6 +894,16 @@ class AppBuilderWindow:
             text="修正版は新しいフォルダーに保存され、今の作品はそのまま残ります。"
             if can_revise else
             "まだアプリ本体（index.html）がないため、ダメ出しはできません。「つづき」から完成させてください。")
+        try:
+            done_manifest_all = json.loads((output / "run.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            done_manifest_all = {}
+        if done_manifest_all.get("mode") == "external_revision":
+            self.done_message.configure(
+                text=self.done_message.cget("text") +
+                f"\n\n元のフォルダー： {done_manifest_all.get('source_folder')}（変更していません）"
+                f"\n何を変えたか： {done_manifest_all.get('change_summary') or '（要約なし）'}"
+                "\n修正版は上の保存先フォルダーの index.html です。問題なければ、その内容を元のアプリの場所へお使いください。")
         if self.run_mode == "revision":
             try:
                 done_manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
@@ -1043,6 +1065,12 @@ class AppBuilderWindow:
         self._start_revision_with_notes(notes)
 
     def _apply_phase_names(self, mode):
+        if mode == "external":
+            names = {"requirements": "📄 既存アプリの確認", "design": "📝 改修の方針",
+                     "implementation": "💻 修正の実装", "qa": "🔍 QA・再検査"}
+            for key, text in names.items():
+                self.phase_widgets[key][3].configure(text=text)
+            return
         if mode == "revision":
             names = {"requirements": "📄 元のアプリ確認", "design": "📝 修正方針を立てる",
                      "implementation": "💻 修正の実装", "qa": "🔍 QA・再検査"}
@@ -1090,7 +1118,142 @@ class AppBuilderWindow:
         except Exception as exc:
             self.events.put(("worker_error", str(exc)))
 
-    # ---- page: publish ----
+    # ---- page: external revision (既存のアプリを直す・育てる) ----
+    def _page_external(self, page):
+        nav = self._nav_row(page)
+        self._big_button(nav, "← もどる", lambda: self.show_page("welcome")).pack(side="left")
+        self.external_start_button = self._big_button(
+            nav, "▶ この内容で直しはじめる", self.start_external_revision, primary=True)
+        self.external_start_button.pack(side="right")
+        self._page_title(page, "🔧 既存のアプリを直す・育てる",
+                         "会社以外で作ったアプリや、作りかけのアプリのフォルダーを選んで、直してほしいこと・追加したい機能を書いてください。"
+                         "元のフォルダーは変更しません。修正版は会社の runs フォルダーに新しく作ります（元のファイルの控えも一緒に保存されます）。"
+                         "対象は1ファイルで完結する単体HTMLアプリです。")
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="both", expand=True, padx=26)
+        pick_row = tk.Frame(body, bg=BG)
+        pick_row.pack(fill="x")
+        self._big_button(pick_row, "📁 フォルダーを選ぶ", self.pick_external_folder).pack(side="left")
+        self.external_folder_label = tk.Label(
+            pick_row, text="まだ選ばれていません", font=self.F(13, True), fg=NAVY, bg=BG, anchor="w")
+        self.external_folder_label.pack(side="left", padx=(14, 0))
+        self.external_status_label = tk.Label(body, text="", font=self.F(12), fg=MUTED, bg=BG,
+                                              anchor="w", wraplength=940, justify="left")
+        self.external_status_label.pack(fill="x", pady=(6, 10))
+        tk.Label(body, text="直してほしいこと・追加したい機能（具体的に書くほど、その通りに直ります）",
+                 font=self.F(14, True), fg=INK, bg=BG, anchor="w").pack(fill="x")
+        self.external_notes = scrolledtext.ScrolledText(
+            body, height=7, wrap="word", font=self.F(15), padx=14, pady=12,
+            highlightbackground=LINE, highlightthickness=1, relief="flat")
+        self.external_notes.pack(fill="both", expand=True, pady=(4, 0))
+        chips = tk.Frame(body, bg=BG)
+        chips.pack(fill="x", pady=(10, 0))
+        tk.Label(chips, text="例文を入れる:", font=self.F(12), fg=MUTED, bg=BG).pack(side="left")
+        for label, example in (
+            ("ボタンを大きく", "ボタンと文字が小さいので、全体的に大きくして、押しやすくしてください。"),
+            ("機能を追加", "（追加したい機能を具体的に書いてください。例: 結果を保存できるボタンを付けてください）"),
+            ("色合いを変更", "色合いを、目にやさしい落ち着いた色に変えてください。"),
+        ):
+            tk.Button(chips, text=label,
+                      command=lambda ex=example: self._set_external_notes(ex),
+                      font=self.F(12), bg=CARD, fg=PRIMARY_DARK, relief="flat",
+                      padx=14, pady=7, cursor="hand2",
+                      highlightbackground=LINE, highlightthickness=1).pack(side="left", padx=(8, 0))
+
+    def _set_external_notes(self, text):
+        self.external_notes.delete("1.0", "end")
+        self.external_notes.insert("1.0", text)
+        self.external_notes.focus_set()
+
+    def pick_external_folder(self):
+        chosen = filedialog.askdirectory(
+            title="直したいアプリのフォルダーを選んでください（単体HTMLアプリ）",
+            parent=self.root)
+        if not chosen:
+            return
+        self.external_folder = Path(chosen)
+        self.external_info = app_builder.inspect_external_target(self.external_folder)
+        self.external_folder_label.configure(text=f"対象のフォルダー: {self.external_folder}")
+        if self.external_info["ok"]:
+            self.external_status_label.configure(
+                text=f"✓ 対象ファイル: {self.external_info['name']}（単体HTML）― このまま依頼できます。",
+                fg=GREEN)
+        else:
+            self.external_status_label.configure(
+                text=f"✗ {self.external_info['reason']}", fg=RED)
+
+    def start_external_revision(self):
+        if self.busy:
+            return
+        if not self.external_folder or not self.external_info or not self.external_info.get("ok"):
+            messagebox.showwarning(
+                "フォルダーを選んでください",
+                "先に「フォルダーを選ぶ」で、単体HTMLアプリのフォルダーを選んでください。"
+                "対象外の場合は、その理由が画面に表示されます。",
+                parent=self.root)
+            return
+        notes = self.external_notes.get("1.0", "end").strip()
+        if not notes:
+            messagebox.showwarning("依頼内容を書いてください",
+                                   "直してほしいこと・追加したい機能を入力欄に書いてから「直しはじめる」を押してください。",
+                                   parent=self.root)
+            self.external_notes.focus_set()
+            return
+        self._start_external_with_notes(notes)
+
+    def _start_external_with_notes(self, notes):
+        try:
+            validate_local_endpoint(self.endpoint_var.get())
+            args, required = self._build_args_and_required()
+        except (ValueError, SystemExit) as exc:
+            if isinstance(exc, SystemExit):
+                return
+            messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
+            return
+        if not self._confirm_big_models(required):
+            return
+        self._begin_external(notes, required, args)
+
+    def _begin_external(self, notes, required, args):
+        self.busy = True
+        self.run_mode = "external"
+        self.cancel_event = threading.Event()
+        self.output_ready = False
+        self.active_models = required
+        self._apply_phase_names("external")
+        self.current_phase = 0
+        self.activity_name = ""
+        self.qa_round = 0
+        self.run_started_at = time.monotonic()
+        self.last_activity_at = self.run_started_at
+        for key, _e, _n, _r in DEPARTMENTS:
+            _icon, model_line, _state, _name = self.phase_widgets[key]
+            model_line.configure(text=f"担当モデル: {required.get(key, '')}")
+            self._set_phase(key, "wait")
+        self.progress_bar.configure(value=0)
+        self.run_status.configure(text="既存のアプリと依頼を確認しています…")
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.append_log(f"既存アプリの改修を受け付けました。対象: {self.external_folder}")
+        self.show_page("run")
+        threading.Thread(target=self._external_worker,
+                         args=(notes, required, args), daemon=True).start()
+
+    def _external_worker(self, notes, required, args):
+        try:
+            output_root = app_builder.resolve_output_root("runs")
+            code, new_run = app_builder.run_external_revision(
+                self.external_folder, notes, args, output_root,
+                progress_callback=lambda line: self.events.put(("progress", line)),
+                token_callback=lambda stage, chars: self.events.put(("tokens", (stage, chars))),
+                cancel_event=self.cancel_event)
+            self.events.put(("output", str(new_run)))
+            self.events.put(("finished", (code, str(new_run))))
+        except Exception as exc:
+            self.events.put(("worker_error", str(exc)))
+
+    # ---- page: publish ----    # ---- page: publish ----
     def _page_publish(self, page):
         nav = self._nav_row(page)
         self._big_button(nav, "← 結果画面にもどる", lambda: self.show_page("done")).pack(side="left")
@@ -1518,7 +1681,9 @@ class AppBuilderWindow:
                     self._set_phase(key, "done")
                 elif pos == index:
                     self._set_phase(key, "active")
-            if self.run_mode == "revision":
+            if self.run_mode == "external":
+                names = ("既存アプリを確認中", "改修の方針を立てています", "修正を実装中", "QAが再検査中")
+            elif self.run_mode == "revision":
                 names = ("元のアプリを確認中", "修正方針を立てています", "修正を実装中", "QAが再検査中")
             else:
                 names = ("PM・要件定義が作成中", "デザイン設計が作成中", "実装が作成中", "QAが検査中")

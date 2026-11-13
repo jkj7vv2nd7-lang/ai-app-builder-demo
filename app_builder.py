@@ -847,6 +847,8 @@ def build_parser():
     parser.add_argument("--max-qa-revisions", type=int, default=2, help="QAによる修正再試行の最大回数")
     parser.add_argument("--max-impl-repairs", type=int, default=2, help="実装直後の静的検証に失敗したときの自動修復の最大回数")
     parser.add_argument("--resume", metavar="RUN_DIR", help="前回の実行フォルダーを指定し、完了した工程を飛ばして再開する")
+    parser.add_argument("--external-revise", metavar="FOLDER",
+                        help="既存の単体HTMLアプリのフォルダーを指定し、依頼文に基づいて直した改訂版を新しい実行フォルダーに作る（元のフォルダーは変更しない）")
     parser.add_argument("--revise", metavar="RUN_DIR", help="完成済みの実行フォルダーを指定し、修正依頼（ダメ出し）に基づいて直した改訂版を新しい実行フォルダーに作る")
     parser.add_argument("--notes", help="--revise 時の修正依頼文（直してほしいこと）")
     parser.add_argument("--notes-file", help="--revise 時の修正依頼文を書いたテキストファイル")
@@ -900,6 +902,123 @@ def _heartbeat_token_callback(log, token_callback):
             log(f"[INFO] 生成継続中…（{stage} / {chars}文字 / この部署の経過 {elapsed // 60}:{elapsed % 60:02d}）")
 
     return wrapped
+
+
+LOCAL_REF_PATTERN = re.compile(
+    r"""(?:src|href)\s*=\s*["'](?!data:|#|https?:|//)([^"']+)["']""")
+
+
+def inspect_external_target(folder):
+    """Check whether a folder holds a revisable single-file HTML app.
+
+    Returns {"ok": bool, "reason": str, "path": Path|None, "name": str,
+    "html": str}. Multi-file apps (local file references), apps depending on
+    external URLs, and folders without a single clear HTML entry point are
+    honestly out of scope for the external-revision intake.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return {"ok": False, "reason": "フォルダーが見つかりません。", "path": None, "name": "", "html": ""}
+    html_files = sorted(folder.glob("*.html")) + sorted(folder.glob("*.htm"))
+    if not html_files:
+        return {"ok": False, "reason": "このフォルダーにはHTMLファイルがありません。単体HTMLアプリのフォルダーを選んでください。",
+                "path": None, "name": "", "html": ""}
+    if (folder / "index.html").is_file():
+        target = folder / "index.html"
+    elif len(html_files) == 1:
+        target = html_files[0]
+    else:
+        return {"ok": False, "reason": "HTMLファイルが複数あり、どれが本体か特定できません（index.html のあるフォルダーを選んでください）。",
+                "path": None, "name": "", "html": ""}
+    html = target.read_text(encoding="utf-8", errors="replace")
+    local_refs = [ref for ref in LOCAL_REF_PATTERN.findall(html) if ref and not ref.startswith("#")]
+    if local_refs:
+        return {"ok": False,
+                "reason": ("別のファイル（" + "、".join(local_refs[:3]) +
+                           "）を読み込む複数ファイル構成のため、この依頼口の対象外です。"
+                           "1ファイルで完結する単体HTMLアプリが対象です。"),
+                "path": target, "name": target.name, "html": html}
+    checks = validate_html(html)
+    if checks["external_dependencies"]:
+        return {"ok": False,
+                "reason": ("外部のURL（" + "、".join(checks["external_dependencies"][:3]) +
+                           "）に依存しているため、この依頼口の対象外です。オフラインで完結する単体HTMLが対象です。"),
+                "path": target, "name": target.name, "html": html}
+    if not checks["passed"]:
+        return {"ok": False,
+                "reason": "元のHTMLに検証上の問題があり、そのままでは改修に入れません: " + "; ".join(checks["errors"][:3]),
+                "path": target, "name": target.name, "html": html}
+    return {"ok": True, "reason": "", "path": target, "name": target.name, "html": html}
+
+
+def run_external_revision(source_folder, notes, args, output_root,
+                          progress_callback=None, token_callback=None,
+                          cancel_event=None):
+    """External-revision intake (既存のアプリを直す・育てる).
+
+    Takes an arbitrary folder holding a single-file HTML app (made anywhere),
+    plus the user's written requests, and produces a revised app in a NEW run
+    directory, reusing the proven revision machinery. The source folder is
+    NEVER written to; a backup copy of the original file is kept inside the
+    run directory as 00_original_backup.html.
+    Returns (exit_code, new_run_dir).
+    """
+    source_folder = Path(source_folder)
+    info = inspect_external_target(source_folder)
+    if not info["ok"]:
+        raise StageError("source", info["reason"])
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    staging = output_root / f".external_src_{secrets.token_hex(3)}"
+    staging.mkdir(parents=True)
+    try:
+        (staging / "index.html").write_text(info["html"], encoding="utf-8")
+        write_json(staging / "run.json", {
+            "request": f"既存アプリの改修（元フォルダー: {source_folder}）",
+            "status": "external_source",
+        })
+        code, run_dir = run_revision(
+            staging, notes, args, output_root,
+            progress_callback=progress_callback,
+            token_callback=token_callback, cancel_event=cancel_event)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    run_dir = Path(run_dir)
+    (run_dir / "00_original_backup.html").write_text(info["html"], encoding="utf-8")
+    manifest_path = run_dir / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    revised_html = ""
+    if (run_dir / "index.html").is_file():
+        revised_html = (run_dir / "index.html").read_text(encoding="utf-8")
+    plan_excerpt = ""
+    plan_path = run_dir / "02_revision_plan.md"
+    if plan_path.is_file():
+        plan_lines = [line.strip().lstrip("-・* ").strip()
+                      for line in plan_path.read_text(encoding="utf-8").splitlines()]
+        plan_excerpt = "／".join(line for line in plan_lines if line)[:160]
+    manifest["mode"] = "external_revision"
+    manifest["source_folder"] = str(source_folder)
+    manifest["source_file"] = info["name"]
+    manifest["change_summary"] = (
+        f"依頼内容: {notes[:80]}"
+        + (f" ／ 方針: {plan_excerpt}" if plan_excerpt else "")
+        + f" ／ 大きさ: {len(info['html'])}字 → {len(revised_html)}字"
+        + f" ／ 変更: {'あり' if manifest.get('changed') else 'なし'}")
+    write_json(manifest_path, manifest)
+    write_run_guide(run_dir, f"既存アプリの改修: {notes[:60]}",
+                    str(manifest.get("status") or "") +
+                    "（元のフォルダーは変更していません。修正版はこのフォルダーの index.html です）")
+    with (run_dir / "はじめにお読みください.txt").open("a", encoding="utf-8") as guide:
+        guide.write("・ 00_original_backup.html … 改修前の元ファイルの控えです\n")
+        guide.write(f"・ 元のフォルダー: {source_folder}（変更していません）\n")
+    closing = (f"[DONE] 元のフォルダーは変更していません: {source_folder}。"
+               "修正版はこの実行フォルダーの index.html です。")
+    with (run_dir / "run.log").open("a", encoding="utf-8") as log_file:
+        log_file.write(closing + "\n")
+    if progress_callback:
+        progress_callback(closing)
+    return code, run_dir
 
 
 def run_pipeline(request_text, args, run_dir, progress_callback=None, token_callback=None, cancel_event=None, resume=False):
@@ -1510,6 +1629,50 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(parser, args)
+
+    if getattr(args, "external_revise", None):
+        source_folder = Path(args.external_revise).expanduser()
+        if not source_folder.is_absolute():
+            source_folder = (Path(__file__).resolve().parent / source_folder)
+        source_folder = source_folder.resolve()
+        ext_notes = (args.notes or "").strip()
+        if not ext_notes and args.notes_file:
+            try:
+                ext_notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                print(f"[ERROR] 修正依頼ファイルを読めません: {exc}", file=sys.stderr)
+                return 1
+        if not ext_notes:
+            print("[ERROR] --external-revise には --notes か --notes-file で依頼文が必要です。", file=sys.stderr)
+            return 1
+        ext_info = inspect_external_target(source_folder)
+        if not ext_info["ok"]:
+            print(f"[ERROR] 対象外です: {ext_info['reason']}", file=sys.stderr)
+            return 1
+        try:
+            if args.routing_mode == "smart":
+                details = fetch_ollama_model_details(args.endpoint, min(args.timeout, 30.0))
+                assignments, _reasons, _suggestions = smart_route_models(details)
+                args.resolved_models = assignments
+                args.routing_reasons = _reasons
+            else:
+                installed = set(fetch_ollama_model_names(args.endpoint, min(args.timeout, 30.0)))
+                required = sorted(set(models_for_run(args).values()))
+                absent = [model for model in required if model not in installed]
+                if absent:
+                    print("[ERROR] 必要なモデルが導入されていません:", file=sys.stderr)
+                    for model in absent:
+                        print(f"  - {model} (導入: ollama pull {model})", file=sys.stderr)
+                    return 1
+            output_root = resolve_output_root(args.out)
+        except StageError as exc:
+            print(f"[ERROR] 工程 '{exc.stage}' で失敗: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] 出力先を準備できません: {exc}", file=sys.stderr)
+            return 1
+        code, _new_run = run_external_revision(source_folder, ext_notes, args, output_root)
+        return code
 
     if getattr(args, "revise", None):
         source_dir = Path(args.revise).expanduser()

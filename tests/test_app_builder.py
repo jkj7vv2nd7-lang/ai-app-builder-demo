@@ -710,5 +710,82 @@ class ValidationRobustnessTests(unittest.TestCase):
 
 
 
+class ExternalRevisionTests(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model="test-model",
+            planning_model=None, design_model=None,
+            implementation_model=None, qa_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3, num_predict=256, num_ctx=2048, timeout=10,
+            max_qa_revisions=1, max_impl_repairs=2, browser_check=False,
+        )
+        self.html = (
+            "<!doctype html><html><head><title>External</title></head>"
+            "<body><main>External app</main></body></html>"
+        )
+
+    def make_folder(self, root, html=None, name="index.html"):
+        folder = Path(root) / "my_app"
+        folder.mkdir()
+        (folder / name).write_text(self.html if html is None else html, encoding="utf-8")
+        return folder
+
+    def test_inspect_accepts_single_file_app(self):
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            folder = self.make_folder(temporary_dir)
+            info = app_builder.inspect_external_target(folder)
+        self.assertTrue(info["ok"])
+        self.assertEqual(info["name"], "index.html")
+
+    def test_inspect_rejects_multi_file_app(self):
+        html = self.html.replace("</body>", "<script src=\"app.js\"></script></body>")
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            folder = self.make_folder(temporary_dir, html=html)
+            info = app_builder.inspect_external_target(folder)
+        self.assertFalse(info["ok"])
+        self.assertIn("対象外", info["reason"])
+
+    def test_inspect_rejects_folder_without_html(self):
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            info = app_builder.inspect_external_target(Path(temporary_dir))
+        self.assertFalse(info["ok"])
+
+    def test_external_revision_keeps_original_and_records_summary(self):
+        revised = self.html.replace("External app", "External app improved")
+        responses = ["改修方針", revised, "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            folder = self.make_folder(root)
+            out_root = root / "out"; out_root.mkdir()
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code, new_run = app_builder.run_external_revision(
+                        folder, "文言を改善して", self.args, out_root)
+            manifest = app_builder.json.loads((new_run / "run.json").read_text(encoding="utf-8"))
+            original_now = (folder / "index.html").read_text(encoding="utf-8")
+            backup = (new_run / "00_original_backup.html").read_text(encoding="utf-8")
+            revised_now = (new_run / "index.html").read_text(encoding="utf-8")
+            staging_left = [p.name for p in out_root.iterdir() if p.name.startswith(".external_src")]
+        self.assertEqual(code, 0)
+        self.assertEqual(original_now, self.html)
+        self.assertEqual(backup, self.html)
+        self.assertEqual(manifest["mode"], "external_revision")
+        self.assertEqual(manifest["source_folder"], str(folder))
+        self.assertIn("External app improved", revised_now)
+        self.assertIn("文言を改善して", manifest["change_summary"])
+        self.assertEqual(staging_left, [])
+
+    def test_external_revision_rejects_out_of_scope(self):
+        html = self.html.replace("</body>", "<script src=\"app.js\"></script></body>")
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            folder = self.make_folder(root, html=html)
+            out_root = root / "out"; out_root.mkdir()
+            with self.assertRaises(app_builder.StageError):
+                app_builder.run_external_revision(folder, "直して", self.args, out_root)
+
+
+
 if __name__ == "__main__":
     unittest.main()
