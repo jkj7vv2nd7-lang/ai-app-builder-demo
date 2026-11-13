@@ -426,5 +426,106 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(call_mock.call_count, 2)
 
 
+class PromptRuleTests(unittest.TestCase):
+    def test_qa_prompt_requires_verifiable_defects_only(self):
+        self.assertIn("コードを見て確認できる具体的な不具合だけ", app_builder.QA_SYSTEM)
+        self.assertIn("NOTES", app_builder.QA_SYSTEM)
+        self.assertIn("未実装」と書かないでください", app_builder.QA_SYSTEM)
+
+    def test_requirements_prompt_scopes_to_single_file_offline(self):
+        self.assertIn("対象外（将来拡張）", app_builder.REQUIREMENTS_SYSTEM)
+        self.assertIn("単一HTML", app_builder.REQUIREMENTS_SYSTEM)
+
+    def test_cli_parser_accepts_revise_options(self):
+        parser = app_builder.build_parser()
+        args = parser.parse_args(["--revise", "runs/run_x", "--notes", "ボタンを大きく"])
+        self.assertEqual(args.revise, "runs/run_x")
+        self.assertEqual(args.notes, "ボタンを大きく")
+
+
+class RevisionTests(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(
+            model="test-model",
+            planning_model=None,
+            design_model=None,
+            implementation_model=None,
+            qa_model=None,
+            endpoint="http://localhost:11434/api/generate",
+            temperature=0.3,
+            num_predict=256,
+            num_ctx=2048,
+            timeout=10,
+            max_qa_revisions=1,
+            max_impl_repairs=2,
+            browser_check=False,
+        )
+        self.html = (
+            "<!doctype html><html><head><title>Test</title></head>"
+            "<body><main>Working app</main></body></html>"
+        )
+
+    def make_source(self, root):
+        source = Path(root) / "source_run"
+        source.mkdir()
+        (source / "index.html").write_text(self.html, encoding="utf-8")
+        (source / "run.json").write_text(
+            app_builder.json.dumps({"request": "メモ帳アプリ", "status": "completed"}),
+            encoding="utf-8")
+        (source / "01_requirements.md").write_text("メモを保存できること", encoding="utf-8")
+        return source
+
+    def test_revision_produces_new_run_and_keeps_source(self):
+        revised = self.html.replace("Working app", "Working app revised")
+        responses = ["修正方針: ボタンを大きくする", revised,
+                     "QA_STATUS: APPROVED\nDEFECTS:\n- なし"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            source = self.make_source(root)
+            out_root = root / "out"
+            out_root.mkdir()
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code, new_run = app_builder.run_revision(
+                        source, "ボタンを大きくして", self.args, out_root)
+            self.assertEqual(code, 0)
+            self.assertNotEqual(new_run, source)
+            self.assertIn("revised", (new_run / "index.html").read_text(encoding="utf-8"))
+            self.assertIn("Working app</main>", (source / "index.html").read_text(encoding="utf-8"))
+            manifest = app_builder.json.loads((new_run / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["mode"], "revision")
+            self.assertEqual(manifest["revision_notes"], "ボタンを大きくして")
+            self.assertTrue(manifest["qa_approved"])
+            self.assertIsNone(manifest["error"])
+
+    def test_revision_unapproved_records_final_defects(self):
+        responses = ["方針", self.html,
+                     "QA_STATUS: NEEDS_REVISION\nDEFECTS:\n- まだ小さい",
+                     self.html,
+                     "QA_STATUS: NEEDS_REVISION\nDEFECTS:\n- まだ小さい"]
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            source = self.make_source(root)
+            out_root = root / "out"
+            out_root.mkdir()
+            with patch.object(app_builder, "call_ollama", side_effect=responses):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code, new_run = app_builder.run_revision(
+                        source, "ボタンを大きくして", self.args, out_root)
+            self.assertEqual(code, 2)
+            manifest = app_builder.json.loads((new_run / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "completed_unapproved")
+            self.assertIn("まだ小さい", manifest["qa_defects_final"])
+
+    def test_revision_requires_index_html(self):
+        with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
+            root = Path(temporary_dir)
+            empty = root / "empty"
+            empty.mkdir()
+            with self.assertRaises(app_builder.StageError):
+                app_builder.run_revision(empty, "直して", self.args, root)
+
+
+
 if __name__ == "__main__":
     unittest.main()

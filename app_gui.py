@@ -4,6 +4,8 @@
 import json
 import os
 import queue
+import re
+import time
 import subprocess
 import sys
 import threading
@@ -266,12 +268,18 @@ class AppBuilderWindow:
         self.cancel_event = None
         self.active_models = {}
         self.current_page = "welcome"
+        self.run_mode = "build"
+        self.current_phase = 0
+        self.run_started_at = None
+        self.last_activity_at = None
+        self.revision_target = None
+        self.revision_return = "welcome"
         self._fonts = []
         self._scale_idx = 0
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3")
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.1")
         root.geometry("1060x800")
         root.minsize(920, 680)
         root.configure(bg=BG)
@@ -300,6 +308,7 @@ class AppBuilderWindow:
             ("models", self._page_models),
             ("run", self._page_run),
             ("done", self._page_done),
+            ("revision", self._page_revision),
             ("publish", self._page_publish),
             ("settings", self._page_settings),
         ):
@@ -309,6 +318,7 @@ class AppBuilderWindow:
             builder(frame)
         self.show_page("welcome")
         self.root.after(150, self.process_events)
+        self.root.after(1000, self._tick_clock)
         self.root.after(400, self.check_connection)
 
     # ---- fonts (resizable) ----
@@ -366,7 +376,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.1 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)
@@ -385,6 +395,7 @@ class AppBuilderWindow:
         "models": "ステップ 2 / 4",
         "run": "ステップ 3 / 4",
         "done": "ステップ 4 / 4",
+        "revision": "ダメ出し（修正依頼）",
         "publish": "GitHub公開",
         "settings": "設定",
     }
@@ -440,9 +451,10 @@ class AppBuilderWindow:
             actions, "▶ アプリを作りはじめる", lambda: self.show_page("idea"), primary=True)
         self.start_flow_button.pack(side="left")
         self._big_button(actions, "つづきから再開", self.resume_generation).pack(side="left", padx=(12, 0))
+        self._big_button(actions, "✎ ダメ出し", self.pick_revision_target).pack(side="left", padx=(12, 0))
         self._big_button(actions, "⚙ 設定", lambda: self.show_page("settings")).pack(side="right")
         tk.Label(page,
-                 text="「つづきから再開」は、前回途中で止まった作業を保存済みの工程から続けるときに使います。",
+                 text="「つづきから再開」は途中で止まった作業の続き、「✎ ダメ出し」は完成した作品に直してほしいことを伝えて直してもらうときに使います。",
                  font=self.F(11), fg=MUTED, bg=BG, anchor="w").pack(fill="x", padx=26, pady=(10, 0))
 
     # ---- page: idea ----
@@ -594,7 +606,9 @@ class AppBuilderWindow:
                          "このままお待ちください。途中で止めても、できたところまでは保存されます。")
         self.run_status = tk.Label(page, text="準備中…", font=self.F(16, True),
                                    fg=PRIMARY_DARK, bg=BG, anchor="w")
-        self.run_status.pack(fill="x", padx=26, pady=(2, 10))
+        self.run_status.pack(fill="x", padx=26, pady=(2, 0))
+        self.elapsed_label = tk.Label(page, text="", font=self.F(12), fg=MUTED, bg=BG, anchor="w")
+        self.elapsed_label.pack(fill="x", padx=26, pady=(0, 10))
         rows = tk.Frame(page, bg=BG)
         rows.pack(fill="x", padx=26)
         self.phase_widgets = {}
@@ -605,19 +619,20 @@ class AppBuilderWindow:
             icon.pack(side="left")
             middle = tk.Frame(card, bg=CARD)
             middle.pack(side="left", fill="x", expand=True)
-            tk.Label(middle, text=f"{emoji} {dept_name}", font=self.F(16, True),
-                     fg=INK, bg=CARD, anchor="w").pack(side="left")
+            name_label = tk.Label(middle, text=f"{emoji} {dept_name}", font=self.F(16, True),
+                                  fg=INK, bg=CARD, anchor="w")
+            name_label.pack(side="left")
             model_line = tk.Label(middle, text="", font=self.F(12), fg=MUTED, bg=CARD, anchor="w")
             model_line.pack(side="left", padx=(14, 0))
             state = tk.Label(card, text="待機中", font=self.F(13, True), fg=MUTED, bg=CARD)
             state.pack(side="right")
-            self.phase_widgets[key] = (icon, model_line, state)
+            self.phase_widgets[key] = (icon, model_line, state, name_label)
         style = ttk.Style(self.root)
         try:
             style.configure("Big.Horizontal.TProgressbar", thickness=22)
         except tk.TclError:
             pass
-        self.progress_bar = ttk.Progressbar(page, mode="determinate", maximum=4, value=0,
+        self.progress_bar = ttk.Progressbar(page, mode="determinate", maximum=400, value=0,
                                             style="Big.Horizontal.TProgressbar")
         self.progress_bar.pack(fill="x", padx=26, pady=(2, 10))
         toggle = tk.Checkbutton(page, text="作業ログを見る", variable=self.show_log_var,
@@ -636,7 +651,7 @@ class AppBuilderWindow:
             self.log_text.pack_forget()
 
     def _set_phase(self, key, mode, state_text=None):
-        icon, _model_line, state = self.phase_widgets[key]
+        icon, _model_line, state, _name = self.phase_widgets[key]
         if mode == "done":
             icon.configure(text="✓", fg=GREEN)
             state.configure(text=state_text or "完了", fg=GREEN)
@@ -682,6 +697,9 @@ class AppBuilderWindow:
         self._big_button(row, "GitHubへ公開する", self.goto_publish).pack(side="left", padx=(12, 0))
         self._big_button(row, "新しいアプリを作る", self.new_app).pack(side="left", padx=(12, 0))
         self.resume_done_button = self._big_button(buttons, "つづきから再開する", self.resume_generation, primary=True)
+        self.revise_done_button = self._big_button(
+            buttons, "✎ ダメ出し：直してほしいことを伝える",
+            lambda: self.goto_revision(self.last_output, "done"))
 
     def new_app(self):
         self.request_text.delete("1.0", "end")
@@ -695,7 +713,8 @@ class AppBuilderWindow:
 
     def _show_done(self, code, output):
         output = Path(output)
-        self.progress_bar.configure(value=4 if code in (0, 2) else self.progress_bar["value"])
+        self.progress_bar.configure(value=400 if code in (0, 2) else self.progress_bar["value"])
+        self.revise_done_button.pack_forget()
         if code == 0:
             self.done_icon.configure(text="✓", fg=GREEN)
             self.done_title.configure(text="アプリが完成しました！")
@@ -724,8 +743,195 @@ class AppBuilderWindow:
                 text="完了した部署の成果は保存されています。もう一度「つづきから再開する」と、続きだけを実行できます。原因は作業ログと保存先の run.json に残っています。")
             self.preview_button.pack_forget()
             self.resume_done_button.pack(pady=(0, 10))
+        if code == 2:
+            try:
+                manifest = json.loads((output / "run.json").read_text(encoding="utf-8"))
+                defects = manifest.get("qa_defects_final") or []
+            except (OSError, json.JSONDecodeError):
+                defects = []
+            if defects:
+                listing = "\n".join(f"・{item}" for item in defects[:3])
+                self.done_message.configure(
+                    text=self.done_message.cget("text") +
+                    f"\n\nQAに残っている指摘（上位{min(3, len(defects))}件）:\n{listing}\n"
+                    "気になる点は「ダメ出し」から伝えて直せます。")
+        self.revise_done_button.pack_forget()
+        can_revise = output and ((output / "index.html").is_file()
+                                 or (output / "index_draft_unverified.html").is_file())
+        if can_revise:
+            self.revise_done_button.pack(pady=(10, 0))
         self.done_path.configure(text=f"保存先: {output}")
         self.show_page("done")
+
+    # ---- page: revision (ダメ出し) ----
+    def _page_revision(self, page):
+        nav = self._nav_row(page)
+        self._big_button(nav, "← もどる", self._back_from_revision).pack(side="left")
+        self.revision_start_button = self._big_button(
+            nav, "▶ この内容で修正をはじめる", self.start_revision, primary=True)
+        self.revision_start_button.pack(side="right")
+        self._page_title(page, "✎ ダメ出し ― 直してほしいことを伝えます",
+                         "完成した作品への修正依頼です。実装の社員が既存のファイルを直し、QAが再検査します。"
+                         "修正版は新しい実行フォルダーに保存され、元の作品はそのまま残ります。")
+        body = tk.Frame(page, bg=BG)
+        body.pack(fill="both", expand=True, padx=26)
+        self.revision_target_label = tk.Label(body, text="", font=self.F(14, True),
+                                              fg=NAVY, bg=BG, anchor="w")
+        self.revision_target_label.pack(fill="x")
+        self.revision_request_label = tk.Label(body, text="", font=self.F(12), fg=MUTED,
+                                               bg=BG, anchor="w", wraplength=940)
+        self.revision_request_label.pack(fill="x", pady=(2, 10))
+        tk.Label(body, text="直してほしいこと（具体的に書くほど、その通りに直ります）",
+                 font=self.F(14, True), fg=INK, bg=BG, anchor="w").pack(fill="x")
+        self.revision_notes = scrolledtext.ScrolledText(
+            body, height=7, wrap="word", font=self.F(15), padx=14, pady=12,
+            highlightbackground=LINE, highlightthickness=1, relief="flat")
+        self.revision_notes.pack(fill="both", expand=True, pady=(4, 0))
+        chips = tk.Frame(body, bg=BG)
+        chips.pack(fill="x", pady=(12, 0))
+        tk.Label(chips, text="例文を入れる:", font=self.F(12), fg=MUTED, bg=BG).pack(side="left")
+        for label, example in (
+            ("停止ボタンを付けて", "読み上げを途中で止めるボタンがありません。停止ボタンを付けてください。"),
+            ("文字を大きく", "文字とボタンが小さいです。全体に大きく、読みやすくしてください。"),
+            ("動きがおかしい", "○○ボタンを押しても動きません。直してください。"),
+        ):
+            tk.Button(chips, text=label,
+                      command=lambda ex=example: self._set_revision_notes(ex),
+                      font=self.F(12), bg=CARD, fg=PRIMARY_DARK, relief="flat",
+                      padx=14, pady=7, cursor="hand2",
+                      highlightbackground=LINE, highlightthickness=1).pack(side="left", padx=(8, 0))
+
+    def _set_revision_notes(self, text):
+        self.revision_notes.delete("1.0", "end")
+        self.revision_notes.insert("1.0", text)
+        self.revision_notes.focus_set()
+
+    def _back_from_revision(self):
+        self.show_page(self.revision_return if self.revision_return in self.pages else "welcome")
+
+    def goto_revision(self, target, return_to):
+        if not target:
+            return
+        target = Path(target)
+        if not ((target / "index.html").is_file() or (target / "index_draft_unverified.html").is_file()):
+            messagebox.showwarning("ダメ出し", "対象のフォルダーに完成したアプリ（index.html）がありません。", parent=self.root)
+            return
+        self.revision_target = target
+        self.revision_return = return_to
+        request = ""
+        try:
+            manifest = json.loads((target / "run.json").read_text(encoding="utf-8"))
+            request = str(manifest.get("request") or "")
+        except (OSError, json.JSONDecodeError):
+            request = ""
+        self.revision_target_label.configure(text=f"対象の作品: {target.name}")
+        self.revision_request_label.configure(
+            text=f"元のアプリ案: {request[:140]}" if request else "元のアプリ案は記録されていません")
+        self.show_page("revision")
+
+    def pick_revision_target(self):
+        if self.busy:
+            return
+        runs_root = Path(__file__).resolve().parent / "runs"
+        chosen = filedialog.askdirectory(
+            title="ダメ出しする作品の実行フォルダーを選んでください（index.html のあるフォルダー）",
+            initialdir=str(runs_root) if runs_root.exists() else str(Path(__file__).resolve().parent),
+            parent=self.root)
+        if chosen:
+            self.goto_revision(Path(chosen), "welcome")
+
+    @staticmethod
+    def _model_size_b(name, details):
+        match = re.search(r":(\d+(?:\.\d+)?)b\b", str(name).lower())
+        if match:
+            return float(match.group(1))
+        for item in details or []:
+            if item.get("name") == name:
+                size_text = str((item.get("details") or {}).get("parameter_size") or "")
+                m2 = re.search(r"(\d+(?:\.\d+)?)\s*B", size_text)
+                if m2:
+                    return float(m2.group(1))
+        return 0.0
+
+    def _confirm_big_models(self, required):
+        big = sorted({m for m in required.values()
+                      if self._model_size_b(m, self.installed_details) >= 20})
+        if not big:
+            return True
+        return messagebox.askyesno(
+            "大きなモデルが含まれています",
+            f"{'、'.join(big)} は大きなモデルです。\n"
+            "16GBのPCでは1回の生成に非常に長い時間がかかり、ゲージが止まって見えることがあります。"
+            "（前回の実機でも、実装に大きなモデルが選ばれていて止まって見えました）\n\n"
+            "このまま続けますか？", parent=self.root)
+
+    def start_revision(self):
+        if self.busy or not self.revision_target:
+            return
+        notes = self.revision_notes.get("1.0", "end").strip()
+        if not notes:
+            messagebox.showwarning("修正依頼を書いてください",
+                                   "直してほしいことを入力欄に書いてから「修正をはじめる」を押してください。",
+                                   parent=self.root)
+            self.revision_notes.focus_set()
+            return
+        try:
+            validate_local_endpoint(self.endpoint_var.get())
+            args, required = self._build_args_and_required()
+        except (ValueError, SystemExit) as exc:
+            if isinstance(exc, SystemExit):
+                return
+            messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
+            return
+        if not self._confirm_big_models(required):
+            return
+        self._begin_revision(notes, required, args)
+
+    def _apply_phase_names(self, mode):
+        if mode == "revision":
+            names = {"requirements": "📄 元のアプリ確認", "design": "📝 修正方針を立てる",
+                     "implementation": "💻 修正の実装", "qa": "🔍 QA・再検査"}
+        else:
+            names = {key: f"{emoji} {dept_name}" for key, emoji, dept_name, _r in DEPARTMENTS}
+        for key, text in names.items():
+            self.phase_widgets[key][3].configure(text=text)
+
+    def _begin_revision(self, notes, required, args):
+        self.busy = True
+        self.run_mode = "revision"
+        self.cancel_event = threading.Event()
+        self.output_ready = False
+        self.active_models = required
+        self._apply_phase_names("revision")
+        self.current_phase = 0
+        self.run_started_at = time.monotonic()
+        self.last_activity_at = self.run_started_at
+        for key, _e, _n, _r in DEPARTMENTS:
+            _icon, model_line, _state, _name = self.phase_widgets[key]
+            model_line.configure(text=f"担当モデル: {required.get(key, '')}")
+            self._set_phase(key, "wait")
+        self.progress_bar.configure(value=0)
+        self.run_status.configure(text="元のアプリと修正依頼を確認しています…")
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+        self.append_log(f"ダメ出しを受け付けました。対象: {self.revision_target}")
+        self.show_page("run")
+        threading.Thread(target=self._revision_worker,
+                         args=(notes, required, args), daemon=True).start()
+
+    def _revision_worker(self, notes, required, args):
+        try:
+            output_root = app_builder.resolve_output_root("runs")
+            code, new_run = app_builder.run_revision(
+                self.revision_target, notes, args, output_root,
+                progress_callback=lambda line: self.events.put(("progress", line)),
+                token_callback=lambda stage, chars: self.events.put(("tokens", (stage, chars))),
+                cancel_event=self.cancel_event)
+            self.events.put(("output", str(new_run)))
+            self.events.put(("finished", (code, str(new_run))))
+        except Exception as exc:
+            self.events.put(("worker_error", str(exc)))
 
     # ---- page: publish ----
     def _page_publish(self, page):
@@ -839,6 +1045,8 @@ class AppBuilderWindow:
                 return
             messagebox.showerror("設定を確認してください", str(exc), parent=self.root)
             return
+        if not self._confirm_big_models(required):
+            return
         self._begin_run(request, required, args, resume_dir=None)
 
     def resume_generation(self):
@@ -879,12 +1087,17 @@ class AppBuilderWindow:
 
     def _begin_run(self, request, required, args, resume_dir):
         self.busy = True
+        self.run_mode = "build"
         self.cancel_event = threading.Event()
         self.output_ready = False
         self.publication_reviewed_var.set(False)
         self.active_models = required
+        self._apply_phase_names("build")
+        self.current_phase = 0
+        self.run_started_at = time.monotonic()
+        self.last_activity_at = self.run_started_at
         for key, _e, _n, _r in DEPARTMENTS:
-            _icon, model_line, _state = self.phase_widgets[key]
+            _icon, model_line, _state, _name = self.phase_widgets[key]
             model_line.configure(text=f"担当モデル: {required.get(key, '')}")
             self._set_phase(key, "wait")
         self.progress_bar.configure(value=0)
@@ -1048,15 +1261,26 @@ class AppBuilderWindow:
                     self.show_page("models")
                 elif kind == "tokens":
                     stage, chars = data
+                    self.last_activity_at = time.monotonic()
                     if not (self.cancel_event is not None and self.cancel_event.is_set()):
                         dept = {"requirements": "PM・要件定義", "design": "デザイン設計",
                                 "implementation": "実装", "qa": "QA・検査"}.get(stage, stage)
+                        if self.run_mode == "revision":
+                            dept = {"requirements": "元のアプリ確認", "design": "修正方針",
+                                    "implementation": "修正の実装", "qa": "QA・再検査"}.get(stage, dept)
                         self.run_status.configure(text=f"{dept}が生成中… {chars}文字")
                         if stage in self.phase_widgets:
                             self._set_phase(stage, "active", f"生成中… {chars}文字")
+                        expected = {"requirements": 1500, "design": 2500,
+                                    "implementation": 9000, "qa": 1500}.get(stage, 4000)
+                        base = self.current_phase * 100
+                        target = base + min(95, int(chars / expected * 100))
+                        if target > int(float(self.progress_bar["value"])):
+                            self.progress_bar.configure(value=target)
                 elif kind == "output":
                     self.last_output = Path(data)
                 elif kind == "progress":
+                    self.last_activity_at = time.monotonic()
                     self.append_log(data)
                     self._handle_progress_line(data)
                 elif kind == "finished":
@@ -1110,21 +1334,35 @@ class AppBuilderWindow:
     def _handle_progress_line(self, line):
         index = progress_phase(line)
         if index is not None:
+            self.current_phase = index
             keys = [k for k, _e, _n, _r in DEPARTMENTS]
             for pos, key in enumerate(keys):
                 if pos < index:
                     self._set_phase(key, "done")
                 elif pos == index:
                     self._set_phase(key, "active")
-            self.progress_bar.configure(value=index + 1)
-            self.run_status.configure(text=f"{DEPARTMENTS[index][2]}の作業中です…")
+            if int(float(self.progress_bar["value"])) < index * 100:
+                self.progress_bar.configure(value=index * 100)
+            if self.run_mode != "revision":
+                self.run_status.configure(text=f"{DEPARTMENTS[index][2]}の作業中です…")
         if "[REPAIR]" in line:
             self.run_status.configure(text="実装を自動で直しています…")
             self._set_phase("implementation", "active", "自動修復中…")
         if "[QA]" in line:
             self._set_phase("qa", "active")
         if "[DONE]" in line:
-            self.progress_bar.configure(value=4)
+            self.progress_bar.configure(value=400)
+
+    def _tick_clock(self):
+        if self.busy and self.run_started_at:
+            elapsed = int(time.monotonic() - self.run_started_at)
+            text = f"経過時間 {elapsed // 60:02d}:{elapsed % 60:02d}"
+            if self.last_activity_at:
+                idle = time.monotonic() - self.last_activity_at
+                if idle >= 15:
+                    text += f" ／ 最後の更新から {int(idle)} 秒（大きなモデルは考え込む時間があります。そのままお待ちください）"
+            self.elapsed_label.configure(text=text)
+        self.root.after(1000, self._tick_clock)
 
     def on_close(self):
         if self.busy:

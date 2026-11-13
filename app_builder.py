@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import socket
+import time
 import subprocess
 import sys
 import urllib.error
@@ -154,7 +155,11 @@ REQUIREMENTS_SYSTEM = """あなたはプロダクトマネージャーです。
 入力されたアプリ案から、対象ユーザー、目的、機能要件、画面と操作、データ、
 今回の対象外と前提を具体的に整理してください。必ず「機能要件」「非機能要件」
 「受け入れ条件」の各見出しを作り、受け入れ条件はテスト可能な箇条書きにしてください。
-不明な点は安全で一般的な前提を明示し、日本語で回答してください。"""
+不明な点は安全で一般的な前提を明示し、日本語で回答してください。
+重要: 成果物は「単一HTMLファイル・オフライン動作」が前提です。要件はブラウザー
+標準機能（DOM操作、音声合成、localStorage等）で実現できる範囲に絞ってください。
+外部AI・サーバー・共有APIが必要な機能は「対象外（将来拡張）」に分類し、
+受け入れ条件には含めないでください。"""
 
 DESIGN_SYSTEM = """あなたはUI/UXデザイナー兼フロントエンド設計者です。
 要件に基づき、画面構成、レスポンシブ対応、配色、操作と状態遷移、
@@ -179,7 +184,23 @@ QA_STATUS: NEEDS_REVISION
 （どの要素・どの処理が、なぜ問題か。問題がなければ「なし」と書いてください）。
 受け入れ条件を満たしているか、ボタンや入力が実際に動きそうか、
 外部CDN/APIなどのネットワーク依存がないかを重点的に見てください。
-静的確認だけでブラウザー実行済みと主張しないでください。"""
+静的確認だけでブラウザー実行済みと主張しないでください。
+判定の厳密さについて:
+- DEFECTSに書けるのは、コードを見て確認できる具体的な不具合だけです。
+  「応答速度が快適か」「セキュリティが確保されているか」「直感的で使いやすいか」
+  のような非機能・主観の項目は、目に見える具体的な問題がない限り欠陥にしないでください。
+- 単体HTML・オフラインでは実現できない機能（外部AIによる生成、サーバー経由の共有
+  など）の不足は欠陥にしないでください。必要なら DEFECTS の後に「NOTES:」として
+  任意の改善案を短く書いてください。
+- コード内に対応する実装がある機能を「未実装」と書かないでください。
+  判定の前に、必ずコード全体で該当する処理があるか確認してください。
+- アプリ案の中核機能がコード上動作する見込みで、重大な不具合がなければ
+  APPROVED としてください。軽微な不足は NOTES に回してください。"""
+
+REVISION_PLAN_SYSTEM = """あなたはソフトウェアの改修計画を立てる設計者です。
+既存アプリへの修正依頼（ダメ出し）を受けて、実装担当がそのまま作業できる
+短い修正方針を日本語で箇条書きしてください。修正依頼の各点を漏らさず拾い、
+変えてはいけない既存の機能も明記してください。"""
 
 REPAIR_SYSTEM = """あなたは熟練したフロントエンドエンジニアです。
 指摘された問題だけを直し、完全な単一HTMLアプリ全体を出力してください。
@@ -663,6 +684,9 @@ def build_parser():
     parser.add_argument("--max-qa-revisions", type=int, default=2, help="QAによる修正再試行の最大回数")
     parser.add_argument("--max-impl-repairs", type=int, default=2, help="実装直後の静的検証に失敗したときの自動修復の最大回数")
     parser.add_argument("--resume", metavar="RUN_DIR", help="前回の実行フォルダーを指定し、完了した工程を飛ばして再開する")
+    parser.add_argument("--revise", metavar="RUN_DIR", help="完成済みの実行フォルダーを指定し、修正依頼（ダメ出し）に基づいて直した改訂版を新しい実行フォルダーに作る")
+    parser.add_argument("--notes", help="--revise 時の修正依頼文（直してほしいこと）")
+    parser.add_argument("--notes-file", help="--revise 時の修正依頼文を書いたテキストファイル")
     parser.add_argument("--out", default="runs", help="パッケージ内の出力ルート")
     parser.add_argument(
         "--browser-check",
@@ -695,6 +719,24 @@ def validate_args(parser, args):
         args.planning_model or args.design_model or args.implementation_model or args.qa_model
     ):
         parser.error("--routing-mode auto/smartでは工程別モデル指定を使わないでください（manualで指定します）")
+
+
+def _heartbeat_token_callback(log, token_callback):
+    """Wrap a token callback so a long, quiet generation still reports
+    signs of life (a progress line every ~30 seconds) in the log/GUI."""
+    state = {"last": time.monotonic(), "starts": {}}
+
+    def wrapped(stage, chars):
+        if token_callback is not None:
+            token_callback(stage, chars)
+        now = time.monotonic()
+        state["starts"].setdefault(stage, now)
+        if now - state["last"] >= 30:
+            state["last"] = now
+            elapsed = int(now - state["starts"][stage])
+            log(f"[INFO] 生成継続中…（{stage} / {chars}文字 / この部署の経過 {elapsed // 60}:{elapsed % 60:02d}）")
+
+    return wrapped
 
 
 def run_pipeline(request_text, args, run_dir, progress_callback=None, token_callback=None, cancel_event=None, resume=False):
@@ -767,10 +809,12 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
             return text or None
         return None
 
+    heartbeat_tokens = _heartbeat_token_callback(log, token_callback)
+
     def call(prompt, system, stage, kind=None):
         check_cancel(stage)
         return call_ollama(prompt, system, args, stage, kind=kind,
-                           token_callback=token_callback, cancel_event=cancel_event)
+                           token_callback=heartbeat_tokens, cancel_event=cancel_event)
 
     write_json(manifest_path, manifest)
     log(f"[INFO] 出力先: {run_dir}")
@@ -943,6 +987,15 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
         }
         write_json(run_dir / "06_browser_check.json", browser_result)
         manifest["browser_check"] = browser_result
+        final_defects = []
+        if not qa_approved and qa_rounds:
+            for line in str(qa_rounds[-1].get("defects") or "").splitlines():
+                cleaned = line.strip().lstrip("-・* ").strip()
+                if cleaned and not cleaned.upper().startswith("DEFECTS"):
+                    final_defects.append(cleaned)
+        manifest["qa_defects_final"] = final_defects[:10]
+        manifest["error"] = None
+        manifest["failed_stage"] = None
         manifest["status"] = "completed" if qa_approved else "completed_unapproved"
         manifest["updated_at"] = datetime.now().astimezone().isoformat()
         write_json(manifest_path, manifest)
@@ -983,10 +1036,316 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
         return 1
 
 
+
+def run_revision(source_dir, notes, args, output_root, progress_callback=None,
+                 token_callback=None, cancel_event=None):
+    """Revision flow (ダメ出し): take a finished run's HTML plus the user's
+    written fix requests, and produce a revised app in a NEW run directory.
+
+    The source run is never modified. Stages mirror the build pipeline so
+    the GUI can reuse its four phase cards:
+      [1/4] confirm source + notes, [2/4] revision plan (design model),
+      [3/4] implementation repair with static checks, [4/4] QA re-review
+      focused on the requested points (round trips capped as usual).
+    Returns (exit_code, new_run_dir).
+    """
+    source_dir = Path(source_dir)
+    source_html_path = source_dir / "index.html"
+    if not source_html_path.is_file():
+        draft = source_dir / "index_draft_unverified.html"
+        if draft.is_file():
+            source_html_path = draft
+        else:
+            raise StageError("revision", f"対象フォルダーに index.html がありません: {source_dir}")
+    source_html = source_html_path.read_text(encoding="utf-8")
+    source_manifest = {}
+    if (source_dir / "run.json").is_file():
+        try:
+            source_manifest = json.loads((source_dir / "run.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            source_manifest = {}
+    original_request = str(source_manifest.get("request") or "（元のアプリ案は記録されていません）")
+    requirements = ""
+    if (source_dir / "01_requirements.md").is_file():
+        requirements = (source_dir / "01_requirements.md").read_text(encoding="utf-8").strip()
+
+    run_dir = create_run_directory(output_root)
+    log_path = run_dir / "run.log"
+
+    def log(message):
+        print(message, flush=True)
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(message + "\n")
+        if progress_callback:
+            progress_callback(message)
+
+    def check_cancel(stage="workflow"):
+        if cancel_event is not None and cancel_event.is_set():
+            raise StageError(stage, "ユーザーにより中止されました。", cancelled=True)
+
+    # Resolve models (same smart-routing behaviour as the build pipeline).
+    routing_reasons = dict(getattr(args, "routing_reasons", None) or {})
+    if getattr(args, "routing_mode", "single") == "smart" and not getattr(args, "resolved_models", None):
+        details = fetch_ollama_model_details(args.endpoint, min(float(getattr(args, "timeout", 600) or 600), 30.0))
+        assignments, routing_reasons, _suggestions = smart_route_models(details)
+        args.resolved_models = assignments
+        args.routing_reasons = routing_reasons
+    models = models_for_run(args)
+
+    manifest_path = run_dir / "run.json"
+    manifest = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "updated_at": datetime.now().astimezone().isoformat(),
+        "mode": "revision",
+        "source_run": str(source_dir),
+        "revision_notes": notes,
+        "request": original_request,
+        "model": args.model,
+        "models": models,
+        "routing_mode": getattr(args, "routing_mode", "single"),
+        "routing_reasons": routing_reasons,
+        "num_ctx": args.num_ctx,
+        "endpoint": args.endpoint,
+        "status": "running",
+        "qa_approved": None,
+        "stages": {},
+    }
+    write_json(manifest_path, manifest)
+
+    heartbeat_tokens = _heartbeat_token_callback(log, token_callback)
+
+    def call(prompt, system, stage, kind=None):
+        check_cancel(stage)
+        return call_ollama(prompt, system, args, stage, kind=kind,
+                           token_callback=heartbeat_tokens, cancel_event=cancel_event)
+
+    log(f"[INFO] 出力先: {run_dir}")
+    log(f"[INFO] ダメ出し対象: {source_dir}")
+    for stage, label in (("requirements", "元のアプリ確認"), ("design", "修正方針"), ("implementation", "修正の実装"), ("qa", "QA・再検査")):
+        log(f"[INFO] {label}: {models[stage]}")
+
+    try:
+        # --- [1/4] confirm ---
+        log("[1/4] 元のアプリと修正依頼を確認中...")
+        (run_dir / "00_revision_request.md").write_text(
+            "# 修正依頼（ダメ出し）\n\n" + notes.strip() + "\n\n"
+            f"対象: {source_dir}\n元のアプリ案: {original_request}\n",
+            encoding="utf-8")
+        if requirements:
+            (run_dir / "01_requirements.md").write_text(requirements.rstrip() + "\n", encoding="utf-8")
+        manifest["stages"]["requirements"] = "completed"
+        write_json(manifest_path, manifest)
+        log("[1/4] 元のアプリと修正依頼を確認しました。")
+
+        # --- [2/4] revision plan ---
+        log(f"[2/4] 修正方針を立てています...（{models['design']}）")
+        try:
+            plan = call(
+                "次の既存アプリへの修正依頼について、実装用の修正方針を箇条書きしてください。\n\n"
+                f"元のアプリ案:\n{original_request}\n\n修正依頼:\n{notes}\n\n"
+                f"現在のHTML（抜粋）:\n{source_html[:6000]}",
+                REVISION_PLAN_SYSTEM, "design")
+        except StageError as exc:
+            if exc.cancelled:
+                raise
+            plan = "（方針の自動生成に失敗したため、修正依頼そのものを方針とします）\n" + notes
+            log(f"[WARN] 修正方針の生成に失敗したため、修正依頼をそのまま使います: {exc}")
+        (run_dir / "02_revision_plan.md").write_text(plan.rstrip() + "\n", encoding="utf-8")
+        manifest["stages"]["design"] = "completed"
+        write_json(manifest_path, manifest)
+
+        # --- [3/4] implementation revision with static-check repair ---
+        log(f"[3/4] 修正を実装中...（{models['implementation']}）")
+        current_html = None
+        checks = None
+        problems = []
+        previous_text = source_html
+        max_repairs = int(getattr(args, "max_impl_repairs", 2))
+        for attempt in range(max_repairs + 1):
+            if attempt == 0:
+                prompt = (
+                    "既存の単一HTMLアプリに、ユーザーの修正依頼（ダメ出し）を反映してください。\n\n"
+                    f"修正依頼:\n{notes}\n\n修正方針:\n{plan}\n\n"
+                    f"現在のHTML:\n{source_html}")
+            else:
+                log(f"[REPAIR] 修正版の自動修復 {attempt}/{max_repairs}（問題: {'; '.join(problems[:3])}）")
+                prompt = (
+                    "次のHTMLには問題があります。問題を直した完全なHTML全体を返してください。\n\n"
+                    f"問題:\n" + "\n".join(f"- {item}" for item in problems) +
+                    f"\n\n現在のHTML:\n{previous_text[-14000:]}")
+            raw = call(prompt, REPAIR_SYSTEM, "implementation", kind="repair")
+            (run_dir / f"03_revision_response_{attempt + 1}.md").write_text(raw.rstrip() + "\n", encoding="utf-8")
+            candidate = extract_html(raw)
+            if not candidate:
+                problems = ["AI応答からHTML文書を抽出できませんでした"]
+                previous_text = raw
+                continue
+            candidate_checks = validate_html(candidate)
+            write_json(run_dir / f"03_revision_checks_{attempt + 1}.json", candidate_checks)
+            if candidate_checks["passed"]:
+                current_html, checks = candidate, candidate_checks
+                break
+            problems = candidate_checks["errors"]
+            previous_text = candidate
+        if current_html is None:
+            partial = extract_html(previous_text)
+            if partial and partial.strip() != source_html.strip():
+                (run_dir / "index_draft_unverified.html").write_text(partial.rstrip() + "\n", encoding="utf-8")
+            raise StageError("implementation", "修正版が静的検証に合格しませんでした: " + "; ".join(problems))
+        (run_dir / "index.html").write_text(current_html.rstrip() + "\n", encoding="utf-8")
+        manifest["stages"]["implementation"] = "completed"
+        write_json(manifest_path, manifest)
+        log("[3/4] 修正版の静的検証に合格しました。")
+
+        # --- [4/4] QA re-review, focused on the requested points ---
+        log(f"[4/4] QAが再検査中...（{models['qa']}）")
+        qa_rounds = []
+        qa_approved = False
+        qa_note = ""
+        max_rounds = int(getattr(args, "max_qa_revisions", 2))
+        for round_number in range(max_rounds + 1):
+            round_label = round_number + 1
+            check_cancel("qa")
+            log(f"[QA] レビュー {round_label}/{max_rounds + 1}")
+            response = call(
+                "次の単一HTMLアプリ（修正版）を審査してください。HTML全体は返さず、判定とDEFECTSだけを返してください。\n"
+                "特に、修正依頼の各点が反映されているかと、既存の中核機能が壊れていないかを確認してください。\n\n"
+                f"修正依頼:\n{notes}\n\n元の要件:\n{requirements or original_request}\n\n現在のHTML:\n{current_html}",
+                QA_SYSTEM, "qa")
+            (run_dir / f"04_qa_round_{round_label}.md").write_text(response.rstrip() + "\n", encoding="utf-8")
+            qa_status = extract_qa_status(response)
+            defects = extract_qa_defects(response)
+            round_info = {"round": round_label, "ai_status": qa_status}
+            if qa_status == "APPROVED":
+                qa_approved = True
+                qa_note = "AI QAは承認を返しました。"
+                round_info["result"] = "approved"
+                qa_rounds.append(round_info)
+                break
+            round_info["result"] = "needs_revision" if qa_status == "NEEDS_REVISION" else "no_clear_verdict"
+            round_info["defects"] = defects[:2000]
+            qa_rounds.append(round_info)
+            if round_number == max_rounds:
+                qa_note = "QA修正回数の上限に達したため、未承認です。修正版HTMLは保存済みです。"
+                break
+            log(f"[QA] 指摘を実装部署で修正します...（{models['implementation']}）")
+            repaired = call(
+                "QAから次の指摘を受けました。指摘だけを直した完全なHTML全体を返してください。\n\n"
+                f"QAの指摘:\n{defects}\n\n現在のHTML:\n{current_html}",
+                REPAIR_SYSTEM, "implementation", kind="repair")
+            candidate = extract_html(repaired)
+            if not candidate:
+                qa_note = "修正応答からHTMLを抽出できなかったため、直近の検証済みHTMLを保持しました。"
+                break
+            candidate_checks = validate_html(candidate)
+            write_json(run_dir / f"04_repair_static_checks_{round_label}.json", candidate_checks)
+            if not candidate_checks["passed"]:
+                qa_note = "修正後HTMLの静的検証に失敗したため、直近の検証済みHTMLを保持しました: " + "; ".join(candidate_checks["errors"])
+                break
+            current_html = candidate
+            checks = candidate_checks
+            (run_dir / "index.html").write_text(current_html.rstrip() + "\n", encoding="utf-8")
+
+        report = [
+            "# QA結果（修正版）",
+            "",
+            f"- AI判定: {'APPROVED' if qa_approved else '未承認'}",
+            f"- 状態: {qa_note or 'QAの承認を得られませんでした。'}",
+            "- 注意: AIの判定と静的検証は、実ブラウザーでの動作テストを意味しません。",
+            "",
+            "## QAラウンド",
+            "",
+            json.dumps(qa_rounds, ensure_ascii=False, indent=2),
+        ]
+        (run_dir / "05_qa_result.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+        manifest["stages"]["qa"] = "completed" if qa_approved else "unapproved"
+        manifest["qa_approved"] = qa_approved
+        manifest["qa_note"] = qa_note
+        manifest["static_checks"] = checks
+        final_defects = []
+        if not qa_approved and qa_rounds:
+            for line in str(qa_rounds[-1].get("defects") or "").splitlines():
+                cleaned = line.strip().lstrip("-・* ").strip()
+                if cleaned and not cleaned.upper().startswith("DEFECTS"):
+                    final_defects.append(cleaned)
+        manifest["qa_defects_final"] = final_defects[:10]
+        manifest["error"] = None
+        manifest["failed_stage"] = None
+        manifest["status"] = "completed" if qa_approved else "completed_unapproved"
+        manifest["updated_at"] = datetime.now().astimezone().isoformat()
+        write_json(manifest_path, manifest)
+        log(f"[DONE] 状態: {manifest['status']}")
+        log(f"[DONE] HTML: {run_dir / 'index.html'}")
+        if not qa_approved:
+            log(f"[WARN] {qa_note}")
+        return (0 if qa_approved else 2), run_dir
+    except StageError as exc:
+        manifest["status"] = "cancelled" if exc.cancelled else "failed"
+        manifest["failed_stage"] = exc.stage
+        manifest["error"] = str(exc)
+        manifest["updated_at"] = datetime.now().astimezone().isoformat()
+        write_json(manifest_path, manifest)
+        if exc.cancelled:
+            log("[CANCELLED] 中止しました。元の作品は変更されていません。")
+            return 3, run_dir
+        log(f"[ERROR] 工程 '{exc.stage}' で失敗: {exc}")
+        return 1, run_dir
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["failed_stage"] = "workflow"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        manifest["updated_at"] = datetime.now().astimezone().isoformat()
+        write_json(manifest_path, manifest)
+        log(f"[ERROR] 実行を完了できませんでした: {type(exc).__name__}: {exc}")
+        return 1, run_dir
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(parser, args)
+
+    if getattr(args, "revise", None):
+        source_dir = Path(args.revise).expanduser()
+        if not source_dir.is_absolute():
+            source_dir = (Path(__file__).resolve().parent / source_dir)
+        source_dir = source_dir.resolve()
+        notes = (args.notes or "").strip()
+        if not notes and args.notes_file:
+            try:
+                notes = Path(args.notes_file).expanduser().read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                print(f"[ERROR] 修正依頼ファイルを読めません: {exc}", file=sys.stderr)
+                return 1
+        if not notes:
+            print("[ERROR] --revise には --notes か --notes-file で修正依頼文が必要です。", file=sys.stderr)
+            return 1
+        if not (source_dir / "index.html").is_file() and not (source_dir / "index_draft_unverified.html").is_file():
+            print(f"[ERROR] 対象フォルダーに index.html がありません: {source_dir}", file=sys.stderr)
+            return 1
+        try:
+            if args.routing_mode == "smart":
+                details = fetch_ollama_model_details(args.endpoint, min(args.timeout, 30.0))
+                assignments, _reasons, _suggestions = smart_route_models(details)
+                args.resolved_models = assignments
+                args.routing_reasons = _reasons
+            else:
+                installed = set(fetch_ollama_model_names(args.endpoint, min(args.timeout, 30.0)))
+                required = sorted(set(models_for_run(args).values()))
+                absent = [model for model in required if model not in installed]
+                if absent:
+                    print("[ERROR] 必要なモデルが導入されていません:", file=sys.stderr)
+                    for model in absent:
+                        print(f"  - {model} (導入: ollama pull {model})", file=sys.stderr)
+                    return 1
+            output_root = resolve_output_root(args.out)
+        except StageError as exc:
+            print(f"[ERROR] 工程 '{exc.stage}' で失敗: {exc}", file=sys.stderr)
+            return 1
+        except (OSError, ValueError) as exc:
+            print(f"[ERROR] 出力先を準備できません: {exc}", file=sys.stderr)
+            return 1
+        code, _new_run = run_revision(source_dir, notes, args, output_root)
+        return code
 
     resume_dir = None
     if getattr(args, "resume", None):
