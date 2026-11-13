@@ -1340,6 +1340,37 @@ def run_pipeline(request_text, args, run_dir, progress_callback=None, token_call
 
 
 
+def defect_notes_text(manifest):
+    """Compose ready-to-send revision notes from a finished run's manifest.
+
+    Uses qa_defects_final (deduplicated, order preserved) plus the render
+    check verdict, so the GUI can pre-fill the feedback box on the done
+    screen: the user just presses 「この内容で直す」 (or edits first),
+    instead of copying QA findings into a memo by hand.
+    Returns "" when there is nothing left to fix.
+    """
+    if not isinstance(manifest, dict):
+        return ""
+    lines = []
+    seen = set()
+    defects = manifest.get("qa_defects_final")
+    if isinstance(defects, list):
+        for item in defects:
+            text = str(item).strip()
+            if text and text not in seen:
+                seen.add(text)
+                lines.append("・ " + text)
+            if len(lines) >= 6:
+                break
+    render = manifest.get("render_check")
+    if isinstance(render, dict) and render.get("ok") is False:
+        lines.append("・ 画面表示の自動確認で「表示が不十分」と判定されました。実際に画面が表示されるよう直してください。")
+    if not lines:
+        return ""
+    return ("QAの検査で、まだ直っていない点が見つかりました。次の点を直してください。\n"
+            + "\n".join(lines))
+
+
 def run_revision(source_dir, notes, args, output_root, progress_callback=None,
                  token_callback=None, cancel_event=None):
     """Revision flow (ダメ出し): take a finished run's HTML plus the user's

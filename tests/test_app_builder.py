@@ -787,5 +787,29 @@ class ExternalRevisionTests(unittest.TestCase):
 
 
 
+class DefectNotesTextTests(unittest.TestCase):
+    def test_empty_when_no_defects(self):
+        self.assertEqual(app_builder.defect_notes_text({}), "")
+        self.assertEqual(app_builder.defect_notes_text({"qa_defects_final": []}), "")
+        self.assertEqual(app_builder.defect_notes_text(None), "")
+
+    def test_deduplicates_and_keeps_order(self):
+        manifest = {"qa_defects_final": ["ボタンAが動かない", "ボタンBが動かない", "ボタンAが動かない", "  "]}
+        text = app_builder.defect_notes_text(manifest)
+        self.assertIn("QAの検査で", text)
+        self.assertEqual(text.count("ボタンAが動かない"), 1)
+        self.assertLess(text.index("ボタンA"), text.index("ボタンB"))
+
+    def test_render_failure_adds_a_line(self):
+        manifest = {"qa_defects_final": [], "render_check": {"ok": False}}
+        text = app_builder.defect_notes_text(manifest)
+        self.assertIn("画面表示の自動確認", text)
+
+    def test_render_ok_adds_nothing(self):
+        manifest = {"render_check": {"ok": True}}
+        self.assertEqual(app_builder.defect_notes_text(manifest), "")
+
+
+
 if __name__ == "__main__":
     unittest.main()

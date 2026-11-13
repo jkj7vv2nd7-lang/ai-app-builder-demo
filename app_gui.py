@@ -364,7 +364,7 @@ class AppBuilderWindow:
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.5")
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.6")
         root.geometry("1060x830")
         root.minsize(920, 700)
         root.configure(bg=BG)
@@ -399,12 +399,14 @@ class AppBuilderWindow:
             ("publish", self._page_publish),
             ("settings", self._page_settings),
         ):
-            if name in ("welcome", "models", "run"):
+            if name in ("welcome", "models", "run", "done"):
                 # v3.4: 内容がウィンドウの高さを超える画面はスクロール可能にする。
                 # 固定 1060x830 のままでは、作品が増えた最初の画面や
                 # 文字を大きくした2番目の画面で一番下が見えなくなるため。
                 # v3.5: 作成中画面にもオーブンの演出が加わり高さが増えたため、
                 # 同じ理由でスクロール可能にした（下のトグルやログが切れないように）。
+                # v3.6: 完成画面も、QAの残り指摘の表示とダメ出し欄への事前入力で
+                # 高さが増えたためスクロール可能にした（下のボタンが切れないように）。
                 frame = self._scrollable_page(name, builder)
             else:
                 frame = tk.Frame(self.container, bg=BG)
@@ -503,7 +505,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.5 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.6 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)
@@ -978,6 +980,10 @@ class AppBuilderWindow:
         self.open_button.pack(side="left")
         self._big_button(row, "GitHubへ公開する", self.goto_publish).pack(side="left", padx=(12, 0))
         self._big_button(row, "新しいアプリを作る", self.new_app).pack(side="left", padx=(12, 0))
+        row2 = tk.Frame(buttons, bg=BG)
+        row2.pack(pady=(10, 0))
+        self._big_button(row2, "モデルを選ぶ画面へ戻る", lambda: self.show_page("models")).pack(side="left")
+        self._big_button(row2, "これでアプリを終了する", self.quit_app).pack(side="left", padx=(12, 0))
         self.resume_done_button = self._big_button(buttons, "つづきから再開する", self.resume_generation, primary=True)
         self.revise_done_button = self._big_button(
             buttons, "✎ ダメ出し：直してほしいことを伝える",
@@ -989,6 +995,13 @@ class AppBuilderWindow:
     def new_app(self):
         self.request_text.delete("1.0", "end")
         self.show_page("idea")
+
+    def quit_app(self):
+        if messagebox.askokcancel(
+                "アプリを終了する",
+                "AIアプリ開発会社を終了しますか？\n作品は実行フォルダーに保存されているので、次回ひらいて続きやダメ出しができます。",
+                parent=self.root):
+            self.root.destroy()
 
     def goto_publish(self):
         if not self.output_ready:
@@ -1053,6 +1066,17 @@ class AppBuilderWindow:
             done_manifest_all = json.loads((output / "run.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             done_manifest_all = {}
+        notes_prefill = app_builder.defect_notes_text(done_manifest_all)
+        self.done_feedback_text.delete("1.0", "end")
+        if notes_prefill:
+            self.done_feedback_text.insert("1.0", notes_prefill)
+            self.done_feedback_text.configure(height=4)
+            current_note = self.done_feedback_note.cget("text")
+            guidance = "QAの指摘を、直しの依頼文として最初から入れてあります。書き足したり不要な行を消したりして、そのまま「この内容で直す」を押せます。"
+            self.done_feedback_note.configure(
+                text=(current_note + " " + guidance) if current_note else guidance)
+        else:
+            self.done_feedback_text.configure(height=2)
         if done_manifest_all.get("mode") == "external_revision":
             self.done_message.configure(
                 text=self.done_message.cget("text") +
