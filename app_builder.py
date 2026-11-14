@@ -23,19 +23,19 @@ from urllib.parse import urlparse
 DEFAULT_ENDPOINT = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 AUTO_MODEL_ROUTING = {
-    "requirements": "qwen3:8b",
-    "design": "qwen3:8b",
-    "implementation": "qwen2.5-coder:7b",
-    "qa": "qwen2.5-coder:7b",
+    "requirements": "qwen3.5:9b",
+    "design": "qwen3.5:9b",
+    "implementation": "qwen3.5:9b",
+    "qa": "qwen3.5:9b",
 }
 STAGES = ("requirements", "design", "implementation", "qa")
 # Models we would ideally like to see installed; used only for advice in
 # smart mode (smart mode never blocks on a missing "ideal" model).
 IDEAL_MODELS = {
-    "requirements": "qwen3:8b",
-    "design": "qwen3:8b",
-    "implementation": "qwen2.5-coder:7b",
-    "qa": "qwen2.5-coder:7b",
+    "requirements": "qwen3.5:9b",
+    "design": "qwen3.5:9b",
+    "implementation": "qwen3.5:9b",
+    "qa": "qwen3.5:9b",
 }
 _CODER_HINTS = ("coder", "code", "starcoder", "codellama", "deepseek-coder", "codegemma")
 _REASONING_HINTS = ("qwen3", "deepseek-r1", "phi4", "phi-4", "llama3", "llama-3")
@@ -64,8 +64,45 @@ def _model_score(name, details, stage, file_size_gb):
     params = _parse_param_billions(details, name)
     score = 0.0
     reasons = []
-    # Capability grows with size, but on a 16GB / CPU machine the practical
-    # sweet spot is 7-9B. Very large models are slow and risk memory pressure.
+    # v3.7: routing is rebalanced for a 16GB machine. Implementation and QA
+    # are centred on the current 9B class (roughly 8-9B, coder variants
+    # included): the size band counts first there, so a huge coder model
+    # can no longer outrank a right-sized one just by being a coder model.
+    if "qwen3.5" in lname:
+        score += 20; reasons.append("現行世代（Qwen 3.5系）")
+    if stage in ("implementation", "qa"):
+        if params:
+            if 7.5 <= params <= 10.5:
+                score += 50; reasons.append("9B級で16GB機の中心域")
+            elif 6.5 <= params < 7.5 or 10.5 < params <= 12:
+                score += 34; reasons.append("9B級に近い大きさ")
+            elif 2.5 <= params < 6.5:
+                score += 18; reasons.append("軽量で高速")
+            elif 12 < params <= 20:
+                score += 6; reasons.append("16GB機では重め")
+            elif params > 20:
+                score -= 40; reasons.append("16GB機には過大")
+            else:
+                score += 8
+        elif file_size_gb:
+            if 4.5 <= file_size_gb <= 7.0:
+                score += 46; reasons.append("サイズが9B級の中心域")
+            elif 3.5 <= file_size_gb < 4.5 or 7.0 < file_size_gb <= 8.5:
+                score += 30
+            elif file_size_gb < 3.5:
+                score += 16; reasons.append("軽量で高速")
+            elif file_size_gb <= 13:
+                score += 4; reasons.append("16GB機では重め")
+            else:
+                score -= 40; reasons.append("ファイルが大きく16GB機には過大")
+        if is_coder:
+            score += 60; reasons.append("コード特化モデル")
+        if any(h in lname for h in _REASONING_HINTS):
+            score += 10
+        if stage == "qa" and is_coder:
+            reasons.append("コードの欠陥検出向き")
+        return score, reasons
+    # requirements / design: general reasoning + Japanese ability first.
     if params:
         if 6.5 <= params <= 9.5:
             score += 40; reasons.append("7〜9B級で16GB機の最適域")
@@ -86,22 +123,14 @@ def _model_score(name, details, stage, file_size_gb):
             score += 14
         else:
             score += 2; reasons.append("ファイルが大きく16GB機には重い")
-    if stage in ("implementation", "qa"):
-        if is_coder:
-            score += 100; reasons.append("コード特化モデル")
-        if any(h in lname for h in _REASONING_HINTS):
-            score += 15
-    else:  # requirements / design: general reasoning + Japanese ability first
-        if not is_coder:
-            score += 70; reasons.append("汎用・推論モデル")
-        else:
-            score += 25
-        if any(h in lname for h in _REASONING_HINTS):
-            score += 25; reasons.append("推論が強い系統")
-        if any(h in lname for h in _JAPANESE_HINTS):
-            score += 15; reasons.append("日本語が得意な系統")
-    if stage == "qa" and is_coder:
-        reasons.append("コードの欠陥検出向き")
+    if not is_coder:
+        score += 70; reasons.append("汎用・推論モデル")
+    else:
+        score += 25
+    if any(h in lname for h in _REASONING_HINTS):
+        score += 25; reasons.append("推論が強い系統")
+    if any(h in lname for h in _JAPANESE_HINTS):
+        score += 15; reasons.append("日本語が得意な系統")
     return score, reasons
 
 
@@ -127,16 +156,25 @@ def smart_route_models(model_details_list):
                 size_gb = 0.0
             items.append((item["name"], item.get("details") or {}, size_gb))
     if not items:
-        raise StageError("connection", "Ollamaにモデルが1つも導入されていません。まず ollama pull qwen2.5-coder:7b を実行してください。")
+        raise StageError("connection", "Ollamaにモデルが1つも導入されていません。まず ollama pull qwen3.5:9b を実行してください。")
+    # v3.7: on a 16GB machine, models over 20B are a last resort for the
+    # automatic routing: they are only assigned when nothing lighter is
+    # installed at all. (Manually chosen big models still get the GUI's
+    # start-time warning dialog.)
+    light = [it for it in items if _parse_param_billions(it[1], it[0]) <= 20]
+    pool = light if light else items
     assignments, reasons = {}, {}
     for stage in STAGES:
         best = None
-        for name, details, size_gb in items:
+        for name, details, size_gb in pool:
             score, why = _model_score(name, details, stage, size_gb)
             if best is None or score > best[0]:
                 best = (score, name, why)
         assignments[stage] = best[1]
-        reasons[stage] = "・".join(dict.fromkeys(best[2])) or "導入済みモデルの中で最適"
+        reason_text = "・".join(dict.fromkeys(best[2])) or "導入済みモデルの中で最適"
+        if not light:
+            reason_text += "・他にモデルがなく大型で代用"
+        reasons[stage] = reason_text
     installed_names = {name for name, _, _ in items}
     suggestions = []
     for stage in STAGES:

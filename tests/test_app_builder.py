@@ -132,10 +132,10 @@ class OutputAndApiTests(unittest.TestCase):
     def test_auto_routing_uses_fixed_role_models(self):
         args = app_builder.build_parser().parse_args(["--routing-mode", "auto", "sample app"])
         models = app_builder.models_for_run(args)
-        self.assertEqual(models["requirements"], "qwen3:8b")
-        self.assertEqual(models["design"], "qwen3:8b")
-        self.assertEqual(models["implementation"], "qwen2.5-coder:7b")
-        self.assertEqual(models["qa"], "qwen2.5-coder:7b")
+        self.assertEqual(models["requirements"], "qwen3.5:9b")
+        self.assertEqual(models["design"], "qwen3.5:9b")
+        self.assertEqual(models["implementation"], "qwen3.5:9b")
+        self.assertEqual(models["qa"], "qwen3.5:9b")
 
     def test_smart_routing_assigns_best_installed_model_per_department(self):
         details = [
@@ -148,14 +148,14 @@ class OutputAndApiTests(unittest.TestCase):
         self.assertEqual(assignments["design"], "qwen3:8b")
         self.assertEqual(assignments["implementation"], "qwen2.5-coder:7b")
         self.assertEqual(assignments["qa"], "qwen2.5-coder:7b")
-        self.assertEqual(suggestions, [])
+        self.assertEqual(suggestions, ["ollama pull qwen3.5:9b"])
         self.assertIn("コード特化", reasons["implementation"])
 
     def test_smart_routing_with_one_model_uses_it_everywhere_and_suggests_ideals(self):
         details = [{"name": "qwen2.5-coder:3b", "size": 1_900_000_000, "details": {"parameter_size": "3B"}}]
         assignments, _reasons, suggestions = app_builder.smart_route_models(details)
         self.assertTrue(all(name == "qwen2.5-coder:3b" for name in assignments.values()))
-        self.assertIn("ollama pull qwen3:8b", suggestions)
+        self.assertIn("ollama pull qwen3.5:9b", suggestions)
 
     def test_smart_routing_requires_at_least_one_model(self):
         with self.assertRaises(app_builder.StageError):
@@ -172,7 +172,7 @@ class OutputAndApiTests(unittest.TestCase):
     def test_auto_routing_requires_explicit_installation_instead_of_fallback(self):
         required = app_gui.models_for_mode("auto", "single-model")
         missing = app_gui.missing_models(required, ["single-model"])
-        self.assertEqual(missing, ["qwen2.5-coder:7b", "qwen3:8b"])
+        self.assertEqual(missing, ["qwen3.5:9b"])
 
     def test_smart_mode_in_gui_uses_installed_details(self):
         details = [
@@ -190,7 +190,7 @@ class OutputAndApiTests(unittest.TestCase):
              contextlib.redirect_stderr(error_stream):
             code = app_builder.main(["--routing-mode", "auto", "sample app"])
         self.assertEqual(code, 1)
-        self.assertIn("ollama pull qwen3:8b", error_stream.getvalue())
+        self.assertIn("ollama pull qwen3.5:9b", error_stream.getvalue())
         self.assertIn("smart", error_stream.getvalue())
         create_run.assert_not_called()
 
@@ -206,13 +206,13 @@ class OutputAndApiTests(unittest.TestCase):
         used_args = run_pipeline.call_args.args[1]
         self.assertEqual(used_args.resolved_models["implementation"], "qwen2.5-coder:7b")
 
-    def test_auto_routing_cli_runs_only_after_both_models_are_present(self):
+    def test_auto_routing_cli_runs_only_after_required_model_is_present(self):
         with tempfile.TemporaryDirectory(dir=TOOL_DIR) as temporary_dir:
             run_dir = Path(temporary_dir)
             with patch.object(
                 app_builder,
                 "fetch_ollama_model_names",
-                return_value=["qwen3:8b", "qwen2.5-coder:7b"],
+                return_value=["qwen3.5:9b"],
             ), patch.object(app_builder, "create_run_directory", return_value=run_dir), patch.object(
                 app_builder, "run_pipeline", return_value=0
             ) as run_pipeline:
@@ -784,6 +784,45 @@ class ExternalRevisionTests(unittest.TestCase):
             out_root = root / "out"; out_root.mkdir()
             with self.assertRaises(app_builder.StageError):
                 app_builder.run_external_revision(folder, "直して", self.args, out_root)
+
+
+
+class RoutingV37Tests(unittest.TestCase):
+    """v3.7: 16GB向けに、実装/QAを現行9B級中心へ寄せた振り分け。"""
+
+    @staticmethod
+    def _details(*specs):
+        return [{"name": name, "size": 5_000_000_000,
+                 "details": {"parameter_size": size}} for name, size in specs]
+
+    def test_users_real_set_keeps_light_coder_for_code_roles(self):
+        details = self._details(("qwen3.5:9b", "9B"), ("qwen2.5-coder:7b", "7B"))
+        assignments, _reasons, _s = app_builder.smart_route_models(details)
+        self.assertEqual(assignments["requirements"], "qwen3.5:9b")
+        self.assertEqual(assignments["design"], "qwen3.5:9b")
+        self.assertEqual(assignments["implementation"], "qwen2.5-coder:7b")
+        self.assertEqual(assignments["qa"], "qwen2.5-coder:7b")
+
+    def test_oversized_coder_is_not_auto_assigned(self):
+        details = self._details(("qwen3.5:9b", "9B"), ("qwen2.5-coder:32b", "32B"))
+        assignments, _reasons, _s = app_builder.smart_route_models(details)
+        self.assertEqual(assignments["implementation"], "qwen3.5:9b")
+        self.assertEqual(assignments["qa"], "qwen3.5:9b")
+        self.assertEqual(assignments["requirements"], "qwen3.5:9b")
+
+    def test_current_9b_coder_tops_implementation(self):
+        details = self._details(
+            ("qwen3.5-coder:9b", "9B"), ("qwen2.5-coder:7b", "7B"), ("qwen3.5:9b", "9B"))
+        assignments, reasons, _s = app_builder.smart_route_models(details)
+        self.assertEqual(assignments["implementation"], "qwen3.5-coder:9b")
+        self.assertEqual(assignments["qa"], "qwen3.5-coder:9b")
+        self.assertIn("9B級", reasons["implementation"])
+
+    def test_only_big_model_installed_falls_back_with_note(self):
+        details = self._details(("qwen3.5:27b", "27B"))
+        assignments, reasons, _s = app_builder.smart_route_models(details)
+        self.assertTrue(all(n == "qwen3.5:27b" for n in assignments.values()))
+        self.assertIn("代用", reasons["implementation"])
 
 
 

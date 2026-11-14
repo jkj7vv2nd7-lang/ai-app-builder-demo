@@ -364,7 +364,7 @@ class AppBuilderWindow:
         self._scales = (1.0, 1.18, 1.36)
         self._scale_names = ("標準", "大", "特大")
 
-        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.6")
+        root.title("AIアプリ開発会社 ― ローカルAIアプリ開発エージェント v3.7")
         root.geometry("1060x830")
         root.minsize(920, 700)
         root.configure(bg=BG)
@@ -505,7 +505,7 @@ class AppBuilderWindow:
         titles.pack(side="left", padx=(10, 0))
         tk.Label(titles, text="AIアプリ開発会社", font=self.F(22, True),
                  bg=NAVY, fg="#FFFFFF", anchor="w").pack(fill="x")
-        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.6 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
+        tk.Label(titles, text="ローカルAIアプリ開発エージェント v3.7 ― あなたのPCの中で、4人のAI社員がアプリを作ります",
                  font=self.F(11), bg=NAVY, fg="#C9D2F2", anchor="w").pack(fill="x")
         right = tk.Frame(header, bg=NAVY)
         right.pack(side="right", padx=20, pady=10)
